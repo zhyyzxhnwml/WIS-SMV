@@ -17,25 +17,16 @@
           <span v-if="i < steps.length - 1" class="step-line" :class="{ done: i < stepIndex }"></span>
         </template>
       </div>
-      <router-link to="/monitor/zone" class="tool-link" :class="{ active: isTool }">
-        <AppIcon name="edit" :size="14" /> 区域分析 <small>工具</small>
-      </router-link>
     </nav>
 
     <!-- 逐步导航：一步看完再看下一步 -->
     <div class="stepper-nav">
-      <template v-if="stepIndex >= 0">
-        <button class="btn btn-secondary" :disabled="stepIndex === 0" @click="go(stepIndex - 1)">← 上一步</button>
-        <span class="nav-pos">
-          <strong>{{ steps[stepIndex].label }}</strong>
-          <span>第 {{ stepIndex + 1 }} / {{ steps.length }} 步</span>
-        </span>
-        <button class="btn btn-primary" :disabled="stepIndex === steps.length - 1" @click="go(stepIndex + 1)">下一步 →</button>
-      </template>
-      <template v-else>
-        <span class="nav-pos"><strong>区域分析</strong><span>工具 · 不属于流水线步骤</span></span>
-        <button class="btn btn-secondary" @click="go(0)">← 回到第 1 步</button>
-      </template>
+      <button class="btn btn-secondary" :disabled="stepIndex === 0" @click="go(stepIndex - 1)">← 上一步</button>
+      <span class="nav-pos">
+        <strong>{{ steps[stepIndex].label }}</strong>
+        <span>第 {{ stepIndex + 1 }} / {{ steps.length }} 步</span>
+      </span>
+      <button class="btn btn-primary" :disabled="stepIndex === steps.length - 1" @click="go(stepIndex + 1)">下一步 →</button>
     </div>
 
     <router-view />
@@ -57,9 +48,8 @@ const steps = [
 const route = useRoute()
 const router = useRouter()
 
-// -1 表示当前不在流水线任一阶段（例如停在「区域分析」工具页）
-const stepIndex = computed(() => steps.findIndex(s => s.to === route.path))
-const isTool = computed(() => route.path === '/monitor/zone')
+// 子路由只有这四步，stepIndex 一定落在 0..3
+const stepIndex = computed(() => Math.max(0, steps.findIndex(s => s.to === route.path)))
 
 function go(i) {
   if (i >= 0 && i < steps.length) router.push(steps[i].to)
@@ -122,22 +112,6 @@ function go(i) {
 }
 .step-line.done { background: #18b8a6; }
 
-.tool-link {
-    display: flex; align-items: center; gap: 6px;
-    padding: 7px 14px;
-    border-radius: 8px;
-    font-size: 13px; font-weight: 600;
-    color: var(--text-secondary);
-    text-decoration: none;
-    border: 1px dashed rgba(169, 205, 226, 0.75);
-    transition: all var(--transition);
-    white-space: nowrap;
-}
-.tool-link small { font-size: 10px; font-weight: 400; opacity: 0.6; }
-.tool-link:hover { color: var(--primary, #0c8ce9); border-color: rgba(12, 140, 233, 0.5); background: rgba(12, 140, 233, 0.06); }
-.tool-link.active { color: #fff; background: linear-gradient(135deg, #0c8ce9, #18b8a6); border-style: solid; border-color: transparent; }
-.tool-link.active small { opacity: 0.85; }
-
 .stepper-nav {
     display: flex; align-items: center; justify-content: space-between; gap: 12px;
     margin: 12px 0 16px;
@@ -154,7 +128,6 @@ function go(i) {
     .step-label { font-size: 12px; }
     .step-no { width: 22px; height: 22px; font-size: 12px; }
     .step-line { min-width: 10px; }
-    .tool-link { padding: 6px 10px; font-size: 12px; }
     .stepper-nav .btn { padding: 6px 12px; font-size: 13px; }
 }
 </style>

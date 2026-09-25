@@ -9,7 +9,8 @@ const routes = [
   { path: '/raw', redirect: '/monitor/raw' },
   { path: '/cleaned', redirect: '/monitor/cleaned' },
   { path: '/final', redirect: '/monitor/final' },
-  { path: '/zone', redirect: '/monitor/zone' },
+  // 区域分析已经不是独立页面了，它回到「最终结果」页里当功能用，老地址指向那里
+  { path: '/zone', redirect: '/monitor/final' },
   { path: '/login', name: 'login', component: () => import('./components/pages/Login.vue'), meta: { title: '登录' } },
   { path: '/dashboard', name: 'dashboard', component: () => import('./components/pages/Dashboard.vue'), meta: { title: '数据分析' } },
   { path: '/monitor', component: () => import('./components/pages/MonitorLayout.vue'), meta: { title: '船舶监控' },
@@ -20,9 +21,8 @@ const routes = [
       { path: 'cleaned', name: 'monitor-cleaned', component: () => import('./components/pages/MonitorCleaned.vue'), meta: { title: '清洗后' } },
       { path: 'cascade', name: 'monitor-cascade', component: () => import('./components/pages/MonitorCascade.vue'), meta: { title: '级联判断后' } },
       // 最终结果沿用原「船舶监控」页（未做改动）
+      // 区域分析是这一页里的一个功能（框选区域 → 出统计），不是独立页面
       { path: 'final', name: 'monitor-final', component: () => import('./components/pages/ShipMonitor.vue'), meta: { title: '最终结果' } },
-      // 区域分析是随取随用的工具，不属于流水线阶段
-      { path: 'zone', name: 'monitor-zone', component: () => import('./components/pages/MonitorZone.vue'), meta: { title: '区域分析' } },
     ]
   },
   { path: '/report', name: 'report', component: () => import('./components/pages/ReportDocuments.vue'), meta: { title: '违规监控' } },

@@ -76,7 +76,7 @@
         <div v-else class="zw-body" :style="{ transform: `scale(${zoomLevel})`, transformOrigin: 'top left' }">
           <!-- 方向分布（极区图 / 风玫瑰图） -->
           <div class="zw-chart-section">
-            <div class="zw-chart-label">方向分布 <span class="zw-axis-hint">（角度 → 轨迹点数）</span></div>
+            <div class="zw-chart-label">方向分布 <span class="zw-axis-hint">（角度 → 船舶数，按每船区域内主航向）</span></div>
             <div class="zw-chart-wrap">
               <svg class="zw-polar" viewBox="0 0 240 240" xmlns="http://www.w3.org/2000/svg">
                 <!-- 同心圆参考线 + 刻度 -->
@@ -101,14 +101,14 @@
                 <!-- 中心圆 -->
                 <circle cx="120" cy="120" r="3" fill="rgba(255,255,255,0.3)"/>
                 <!-- Y轴标注 -->
-                <text x="6" y="124" fill="rgba(255,255,255,0.25)" font-size="6" transform="rotate(-90,6,124)">轨迹点数</text>
+                <text x="6" y="124" fill="rgba(255,255,255,0.25)" font-size="6" transform="rotate(-90,6,124)">船舶数</text>
               </svg>
             </div>
           </div>
 
           <!-- 速度分布（直方图） -->
           <div class="zw-chart-section">
-            <div class="zw-chart-label">速度分布 <span class="zw-axis-hint">（速度区间 → 轨迹点数）</span></div>
+            <div class="zw-chart-label">速度分布 <span class="zw-axis-hint">（速度区间 → 船舶数，按每船区域内均速）</span></div>
             <div class="zw-chart-wrap">
               <svg class="zw-bar" viewBox="0 0 260 100" xmlns="http://www.w3.org/2000/svg">
                 <!-- Y轴参考线 -->
@@ -119,7 +119,7 @@
                 <text x="26" y="47" text-anchor="end" fill="rgba(255,255,255,0.25)" font-size="6">{{ Math.round(maxSpeedCount / 2) }}</text>
                 <text x="26" y="82" text-anchor="end" fill="rgba(255,255,255,0.2)" font-size="6">0</text>
                 <!-- Y轴标注 -->
-                <text x="4" y="50" fill="rgba(255,255,255,0.3)" font-size="6" transform="rotate(-90,4,50)">轨迹点数</text>
+                <text x="4" y="50" fill="rgba(255,255,255,0.3)" font-size="6" transform="rotate(-90,4,50)">船舶数</text>
                 <!-- 柱子 -->
                 <rect v-for="(bin, i) in (result.speedDistribution || [])" :key="'s'+i"
                       :x="35 + i * 37" :y="80 - barHeight(bin.count, maxSpeedCount, 65)"
@@ -137,7 +137,7 @@
 
           <!-- 时间分布（直方图） -->
           <div class="zw-chart-section">
-            <div class="zw-chart-label">时间分布 <span class="zw-axis-hint">（时刻 → 轨迹点数）</span></div>
+            <div class="zw-chart-label">进入时刻 <span class="zw-axis-hint">（首次进入时刻 → 船舶数）</span></div>
             <div class="zw-chart-wrap">
               <svg class="zw-bar" viewBox="0 0 260 100" xmlns="http://www.w3.org/2000/svg">
                 <!-- Y轴参考线 -->
@@ -148,7 +148,7 @@
                 <text x="26" y="47" text-anchor="end" fill="rgba(255,255,255,0.25)" font-size="6">{{ Math.round(maxTimeCount / 2) }}</text>
                 <text x="26" y="82" text-anchor="end" fill="rgba(255,255,255,0.2)" font-size="6">0</text>
                 <!-- Y轴标注 -->
-                <text x="4" y="50" fill="rgba(255,255,255,0.3)" font-size="6" transform="rotate(-90,4,50)">轨迹点数</text>
+                <text x="4" y="50" fill="rgba(255,255,255,0.3)" font-size="6" transform="rotate(-90,4,50)">船舶数</text>
                 <!-- 柱子 -->
                 <rect v-for="(bin, i) in (result.timeDistribution || [])" :key="'t'+i"
                       :x="33 + i * 9.2" :y="80 - barHeight(bin.count, maxTimeCount, 65)"
@@ -164,13 +164,36 @@
             </div>
           </div>
 
-          <!-- 底部统计摘要 -->
+          <!-- 船舶列表（船舶单位：区域内每船一行，按区域内点数降序） -->
+          <div class="zw-chart-section">
+            <div class="zw-chart-label">船舶列表 <span class="zw-axis-hint">（共 {{ (result.ships || []).length }} 艘）</span></div>
+            <table class="zw-ship-table">
+              <thead><tr><th>MMSI</th><th>均速</th><th>主航向</th><th>驻留</th><th>状态</th></tr></thead>
+              <tbody>
+                <tr v-for="s in (result.ships || []).slice(0, 12)" :key="s.mmsi">
+                  <td>{{ s.mmsi }}</td>
+                  <td>{{ s.zoneAvgSpeed }}kn</td>
+                  <td>{{ s.mainCourse != null ? s.mainCourse + '°' : '-' }}</td>
+                  <td>{{ s.dwellMinutes ? s.dwellMinutes + 'min' : '-' }}</td>
+                  <td>
+                    <span v-if="s.violationDetected" class="risk-tag risk-high">违规</span>
+                    <span v-else-if="s.anchored" class="risk-tag risk-low">锚泊</span>
+                    <span v-else class="risk-tag risk-sailing">航行</span>
+                  </td>
+                </tr>
+                <tr v-if="(result.ships || []).length === 0"><td colspan="5" class="zw-empty">无</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- 底部统计摘要（全部为船舶单位） -->
           <div class="zw-summary">
-            <span><AppIcon name="clock" inline /> {{ result.avgSpeed || 0 }}kn</span>
-            <span><AppIcon name="compass" inline /> {{ result.avgCourse || 0 }}°</span>
-            <span v-if="result.violatedShips && result.violatedShips.length > 0" style="color:#ff6b6b;">
-              <AppIcon name="alert-octagon" inline /> {{ result.violatedShips.length }}违规
-            </span>
+            <span><AppIcon name="ship" inline /> {{ result.shipCount || 0 }}艘</span>
+            <span style="color:#0f9d58;"><AppIcon name="compass" inline /> {{ result.sailingCount || 0 }}航行</span>
+            <span style="color:#f59e0b;"><AppIcon name="anchor" inline /> {{ result.anchoredCount || 0 }}锚泊</span>
+            <span v-if="(result.violatedShips || []).length" style="color:#ff6b6b;"><AppIcon name="alert-octagon" inline /> {{ result.violatedShips.length }}违规</span>
+            <span><AppIcon name="clock" inline /> 均速 {{ result.avgSpeed || 0 }}kn</span>
+            <span><AppIcon name="clock" inline /> 均驻留 {{ result.avgDwellMinutes || 0 }}min</span>
           </div>
         </div>
       </div>
@@ -687,7 +710,7 @@ onUnmounted(() => {
 /* ========= 区域分析浮动窗口 ========= */
 .zone-window {
   position: fixed; z-index: 99999;
-  width: 300px;
+  width: 340px;   /* 放得下 5 列的船舶列表 */
   max-height: 90vh;
   background: linear-gradient(170deg, rgba(8, 36, 61, 0.96), rgba(6, 31, 56, 0.94));
   backdrop-filter: blur(16px) saturate(1.4);
@@ -735,8 +758,18 @@ onUnmounted(() => {
 .zw-polar { width: 100%; height: auto; display: block; }
 .zw-bar { width: 100%; height: auto; display: block; }
 
+/* 船舶列表：区域内每船一行（船舶单位，不是轨迹点） */
+.zw-ship-table { width: 100%; border-collapse: collapse; font-size: 10px; color: rgba(255,255,255,0.8); }
+.zw-ship-table th, .zw-ship-table td { text-align: left; padding: 3px 5px; border-bottom: 1px solid rgba(118, 200, 255, 0.1); }
+.zw-ship-table th { color: rgba(150, 210, 245, 0.6); font-weight: 600; }
+.zw-empty { text-align: center; color: rgba(255,255,255,0.4); }
+.risk-tag { display: inline-block; padding: 1px 5px; border-radius: 4px; color: #fff; font-weight: 600; font-size: 9px; }
+.risk-tag.risk-high { background: #ea4335; }
+.risk-tag.risk-low { background: #f59e0b; }
+.risk-tag.risk-sailing { background: #0f9d58; }
+
 .zw-summary {
-  display: flex; gap: 12px; justify-content: center;
+  display: flex; gap: 6px 12px; flex-wrap: wrap; justify-content: center;
   padding: 6px 0 2px;
   font-size: 11px; color: rgba(150, 210, 245, 0.75);
   border-top: 1px solid rgba(118, 200, 255, 0.12);
