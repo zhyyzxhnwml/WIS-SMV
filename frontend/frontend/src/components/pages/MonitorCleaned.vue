@@ -1,6 +1,6 @@
 <template>
   <div class="monitor-page">
-    <PageHeader icon="check-circle" title="数据清洗后可视化" subtitle="清洗保留轨迹（断段/跳变/中断标记） + 船舶单位质量统计">
+    <PageHeader icon="check-circle" title="第 2 步 · 数据清洗后" subtitle="上一步的原始轨迹与噪声点淡化保留，本步叠加上清洗后保留的轨迹">
       <button class="btn btn-primary" @click="reload"><AppIcon name="refresh-cw" inline /> 刷新</button>
     </PageHeader>
 
@@ -15,6 +15,11 @@
       <div class="map-overlay-top-left">
         <div class="map-legend">
           <h4>图例</h4>
+          <div class="legend-item" style="opacity:0.55;"><span class="dot" style="background:#b0bec5;width:14px;border-radius:0;"></span> 上一步：原始轨迹</div>
+          <div class="legend-item" style="opacity:0.55;"><span class="dot" style="background:#ff9800;"></span> 上一步：噪声点</div>
+          <div class="legend-item" style="margin-bottom:7px;padding-bottom:7px;border-bottom:1px solid rgba(255,255,255,0.15);">
+            <span class="dot" style="background:#fff;"></span> <strong>本步：保留轨迹 ↓</strong>
+          </div>
           <div class="legend-item"><span class="dot" style="background:var(--normal-color,#0f9d58);"></span> 正常航行</div>
           <div class="legend-item"><span class="dot" style="background:var(--violating-color,#ea4335);"></span> 违规船舶</div>
           <div class="legend-item"><span class="dot" style="background:#ffb74d;border-radius:0;width:14px;"></span> 位置跳变段（虚线）</div>
@@ -32,7 +37,7 @@
         <span v-if="hoverShip.onLandPoints" style="color:#ffb74d;">陆地点 {{ hoverShip.onLandPoints }} · 横穿 {{ hoverShip.landCrossings }}</span>
       </div>
       <div class="map-loading" v-if="loading"><AppIcon name="hourglass" inline /> 加载数据中...</div>
-      <div class="map-loaded" v-else><AppIcon name="check-circle" inline /> {{ trackCount }} 条轨迹</div>
+      <div class="map-loaded" v-else><AppIcon name="check-circle" inline /> 本步保留 {{ ships.length }} 条轨迹 · 底层淡化 {{ rawShips.length }} 条</div>
     </div>
 
     <div class="stats-row">
@@ -54,10 +59,12 @@ import * as echarts from 'echarts'
 import PageHeader from '../../components/PageHeader.vue'
 import AppIcon from '../../components/AppIcon.vue'
 import { useTrackMap } from '../../composables/useTrackMap.js'
-import { fetchShips } from '../../api/ships.js'
+import { getRawTracks, getCleanedShips } from '../../store/pipeline.js'
 
-const { mapContainer, initMap, destroyMap, drawShips, hoverShip, hoverStyle, trackCount } = useTrackMap()
+const { mapContainer, initMap, destroyMap, drawLayer, drawPoints, clearTracks,
+        fitOrKeep, hoverShip, hoverStyle } = useTrackMap()
 
+const rawShips = ref([])   // 上一步（原始数据）的船，作为淡化底层
 const ships = ref([])
 const shipTotal = ref(0)
 const searchText = ref('')
@@ -87,17 +94,48 @@ function infoOf(ship) {
 async function reload() {
   loading.value = true
   try {
-    const data = await fetchShips()
+    // 累积叠加：本步要叠在「原始数据」之上，所以原始轨迹和噪声点也得拿到
+    // （store 里按 promise 记忆，上一步已经拉过就直接复用，不会重复请求）
+    const [raw, data] = await Promise.all([getRawTracks(), getCleanedShips()])
+    rawShips.value = raw?.ships || []
     shipTotal.value = data.total || 0
     ships.value = data.list || []
     await nextTick()
-    drawShips(ships.value, { colorOf, infoOf, filterText: searchText.value })
+    drawCumulative()
     computeQualityStats()
     buildCharts()
   } catch (e) { console.error('cleaned tracks load failed', e) }
   finally { loading.value = false }
 }
-function doSearch() { drawShips(ships.value, { colorOf, infoOf, filterText: searchText.value }) }
+
+/**
+ * 累积叠加：先铺一层上一步的原始轨迹与噪声点（淡化），
+ * 再把本步保留的轨迹画在上面 —— 一眼能看出这一步把哪些点剔掉了。
+ */
+function drawCumulative() {
+  clearTracks()
+  if (rawShips.value.length) {
+    drawLayer(rawShips.value, {
+      colorOf: () => ({ color: '#b0bec5', weight: 1, opacity: 0.16 }),
+      zIndex: 1, count: false,
+      showJumpLegs: false, showGapLegs: false, showLandPoints: false,
+    })
+    const noise = []
+    for (const s of rawShips.value) {
+      for (const p of (s.rawTrack || [])) {
+        if (p.flags?.length) {
+          noise.push({ lng: p.lng, lat: p.lat,
+            color: p.flags.some(f => f.includes('on_land')) ? '#ff5722' : '#ff9800' })
+        }
+      }
+    }
+    drawPoints(noise, { radius: 3, opacity: 0.3, zIndex: 2 })
+  }
+  drawLayer(ships.value, { colorOf, infoOf, filterText: searchText.value, zIndex: 6 })
+  fitOrKeep()
+}
+
+function doSearch() { drawCumulative() }
 
 function qlLabel(l) { return l === 'good' ? '良好' : l === 'fair' ? '一般' : '较差' }
 

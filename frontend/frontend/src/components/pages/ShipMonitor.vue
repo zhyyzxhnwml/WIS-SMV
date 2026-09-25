@@ -1,6 +1,6 @@
 <template>
   <div class="page">
-    <PageHeader icon="radar" title="船舶监控" subtitle="辖区船舶实时轨迹与航行动态">
+    <PageHeader icon="radar" title="第 4 步 · 最终结果" subtitle="累积叠加的最后一层：全部轨迹 + 违规着色 + 陆地段标记。区域分析在这一步才可用">
       <button class="btn btn-secondary" @click="toggleDrawMode">
         <AppIcon :name="drawMode ? 'hand' : 'edit'" inline /> {{ drawMode ? '退出绘制' : '区域分析' }}
       </button>
@@ -31,6 +31,9 @@
           <div class="legend-item"><span class="dot" style="background:rgba(176,190,197,0.7);border-radius:0;width:14px;"></span> 数据间隔（灰虚线）</div>
           <div class="legend-item"><span class="dot" style="background:rgba(141,110,99,0.8);border-radius:0;width:14px;"></span> 横穿陆地段（灰虚线）</div>
           <div class="legend-item"><span class="dot" style="background:#ff5722;"></span> 陆地点（异常）</div>
+          <div class="legend-item" style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.15);">
+            <span class="dot" style="background:#ff1744;opacity:0.5;"></span> 第 3 步 L1 事件点（淡化保留）
+          </div>
           <div class="legend-item" style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.15);">
             <span class="dot" style="background:#ff6b00;"></span> 分析区域
           </div>
@@ -207,11 +210,14 @@ import PageHeader from '../../components/PageHeader.vue'
 import AppIcon from '../../components/AppIcon.vue'
 import { aiConfig } from '../../store/ai.js'
 import { loadAMap } from '../../utils/amap.js'
+import { DEFAULT_VIEW, applyView, rememberView } from '../../composables/mapView.js'
+import { getAllTracks, getCascadeTracks } from '../../store/pipeline.js'
 
 const mapContainer = ref(null)
 const searchText = ref('')
 const allTracks = ref([])
 const shipTotal = ref(0)
+const l1Dots = ref([])   // 第 3 步的 L1 事件点，本步淡化保留
 const loading = ref(true)
 const hoverShip = ref(null)
 const hoverStyle = ref({})
@@ -332,14 +338,20 @@ async function initMap() {
     var AMap = await loadAMap()
     AMapLib = AMap
     map = new AMap.Map(mapContainer.value, {
-      center: [106.663, 29.582],
-      zoom: 15,
+      center: DEFAULT_VIEW.center,
+      zoom: DEFAULT_VIEW.zoom,
       mapStyle: 'amap://styles/light',
       resizeEnable: true,
       showIndoorMap: false,
       layers: [new AMap.TileLayer.Satellite()],
     })
-    setTimeout(() => map.setFitView(), 500)
+    // 视野与前三步共用：没定过就适配一次并记住，定过就沿用 —— 这一步是累积的最后一层，
+    // 视野必须和前面几步一致，才能看出最终判断是在同一张图上"长"出来的
+    if (!applyView(map)) {
+      setTimeout(() => { if (map) { map.setFitView(); rememberView(map) } }, 500)
+    }
+    map.on('moveend', () => rememberView(map))
+    map.on('zoomend', () => rememberView(map))
 
     map.on('click', function(e) {
       if (!drawMode.value || !map) return
@@ -479,11 +491,17 @@ async function triggerAnalysis() {
 async function loadAllTracks() {
   loading.value = true
   try {
-    const resp = await fetch('/api/v1/ships/all-tracks')
-    const json = await resp.json()
-    if (json.code === 200 && json.data) {
-      allTracks.value = json.data
-      shipTotal.value = json.data.length
+    // 走 store：前三步拉过的数据在这里直接复用，第 4 步只多叠自己的违规着色
+    const data = await getAllTracks()
+    if (data) {
+      allTracks.value = data
+      shipTotal.value = data.length
+      // 第 3 步叠的 L1 事件点在这一步继续淡化保留
+      // ——「最终判断是在前几层上长出来的」得有看得见的痕迹
+      try {
+        const cas = await getCascadeTracks()
+        l1Dots.value = collectL1Dots(cas?.ships || [])
+      } catch (e) { l1Dots.value = [] }
       if (map) { await nextTick(); drawAllTracks() }
     }
   } catch (e) {
@@ -491,6 +509,20 @@ async function loadAllTracks() {
   } finally {
     loading.value = false
   }
+}
+
+// 每船取轨迹中点标一个 L1 事件点（high=红 / 其他=橙），供第 4 步淡化保留
+function collectL1Dots(ships) {
+  const dots = []
+  for (const s of ships) {
+    const evs = s.l1?.events || []
+    if (!evs.length) continue
+    const t = s.track || []
+    if (t.length < 2) continue
+    const mid = t[Math.floor(t.length / 2)]
+    dots.push({ lng: mid.lng, lat: mid.lat, high: evs.some(e => e.priority === 'high') })
+  }
+  return dots
 }
 
 function drawAllTracks(filterText = '') {
@@ -575,7 +607,23 @@ function drawAllTracks(filterText = '') {
     })
   })
 
-  if (allPaths.length > 0) map.setFitView(null, false, [50, 50, 50, 50])
+  // 第 3 步的 L1 事件点淡化保留：前一层没被这一步的着色盖掉
+  l1Dots.value.forEach(d => {
+    const dot = new AMap.CircleMarker({
+      center: [d.lng, d.lat], radius: 4, zIndex: 90,
+      strokeColor: d.high ? '#ff1744' : '#ffb74d', strokeOpacity: 0.55,
+      fillColor: d.high ? '#ff1744' : '#ffb74d', fillOpacity: 0.35,
+    })
+    dot.setMap(map)
+    polylines.push(dot)
+  })
+
+  // 视野：已经和前几步共用一份视野就沿用（上一步/下一步来回翻不跳），
+  // 没定过才按数据适配一次并记住
+  if (allPaths.length > 0 && !applyView(map)) {
+    map.setFitView(null, false, [50, 50, 50, 50])
+    rememberView(map)
+  }
 }
 
 // 相邻点间距超过该值(km) → 视为数据间隔（历史数据可能无 tag，几何兜底断段，避免强行连线）

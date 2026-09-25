@@ -38,11 +38,13 @@ import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '../../components/AppIcon.vue'
 
+// 四步是累积关系：每一步把上一步的画面淡化保留、再叠上自己的结果，
+// 所以 hint 都写成「＋xxx」——点下一步只会多一层，不会换成另一张图。
 const steps = [
-  { to: '/monitor/raw', label: '原始数据', hint: '清洗前轨迹 + 噪声点' },
-  { to: '/monitor/cleaned', label: '清洗后', hint: '保留轨迹 + 质量标记' },
-  { to: '/monitor/cascade', label: '级联判断后', hint: 'L1/L2/L3 判定结果' },
-  { to: '/monitor/final', label: '最终结果', hint: '全部轨迹与违规着色' },
+  { to: '/monitor/raw', label: '原始数据', hint: '起点：轨迹 + 噪声点' },
+  { to: '/monitor/cleaned', label: '清洗后', hint: '＋保留轨迹（原始淡化铺底）' },
+  { to: '/monitor/cascade', label: '级联判断后', hint: '＋L1/L2/L3 逐层累加' },
+  { to: '/monitor/final', label: '最终结果', hint: '＋违规着色 · 区域分析' },
 ]
 
 const route = useRoute()

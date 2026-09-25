@@ -20,8 +20,7 @@ const routes = [
       { path: 'raw', name: 'monitor-raw', component: () => import('./components/pages/MonitorRaw.vue'), meta: { title: '原始数据' } },
       { path: 'cleaned', name: 'monitor-cleaned', component: () => import('./components/pages/MonitorCleaned.vue'), meta: { title: '清洗后' } },
       { path: 'cascade', name: 'monitor-cascade', component: () => import('./components/pages/MonitorCascade.vue'), meta: { title: '级联判断后' } },
-      // 最终结果沿用原「船舶监控」页（未做改动）
-      // 区域分析是这一页里的一个功能（框选区域 → 出统计），不是独立页面
+      // 最终结果页：在前面几步的底图上再叠违规着色，区域分析是这一页里的功能
       { path: 'final', name: 'monitor-final', component: () => import('./components/pages/ShipMonitor.vue'), meta: { title: '最终结果' } },
     ]
   },

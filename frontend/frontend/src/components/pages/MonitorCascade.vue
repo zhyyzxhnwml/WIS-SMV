@@ -1,10 +1,11 @@
 <template>
   <div class="monitor-page">
-    <PageHeader icon="radar" title="级联判断后可视化" subtitle="L1 候选事件 · L2 ML 路由 · L3 LLM 判定（全部以船舶为单位）">
+    <PageHeader icon="radar" title="第 3 步 · 级联判断后" subtitle="逐层累加：L1 事件 → 叠加 L2 路由 → 叠加 L3 判定，前一层的结果不会被盖掉">
+      <!-- 累加而不是互斥：每按一次多叠一层，判断是一层层"长"出来的 -->
       <div class="layer-toggle">
-        <button :class="['btn', layer==='l3' ? 'btn-primary' : 'btn-secondary']" @click="switchLayer('l3')">L3 判定</button>
-        <button :class="['btn', layer==='l2' ? 'btn-primary' : 'btn-secondary']" @click="switchLayer('l2')">L2 路由</button>
-        <button :class="['btn', layer==='l1' ? 'btn-primary' : 'btn-secondary']" @click="switchLayer('l1')">L1 事件</button>
+        <button :class="['btn', level===1 ? 'btn-primary' : 'btn-secondary']" @click="switchLevel(1)">L1 事件</button>
+        <button :class="['btn', level===2 ? 'btn-primary' : 'btn-secondary']" @click="switchLevel(2)">＋L2 路由</button>
+        <button :class="['btn', level===3 ? 'btn-primary' : 'btn-secondary']" @click="switchLevel(3)">＋L3 判定</button>
       </div>
       <button class="btn btn-primary" @click="reload"><AppIcon name="refresh-cw" inline /> 刷新</button>
     </PageHeader>
@@ -19,34 +20,36 @@
     <div class="map-container" ref="mapContainer">
       <div class="map-overlay-top-left">
         <div class="map-legend">
-          <h4>图例（{{ layer === 'l3' ? 'L3 判定' : layer === 'l2' ? 'L2 路由' : 'L1 事件' }}）</h4>
-          <template v-if="layer === 'l3'">
-            <div class="legend-item"><span class="dot" style="background:var(--violating-color,#ea4335);"></span> 违规</div>
-            <div class="legend-item"><span class="dot" style="background:var(--normal-color,#0f9d58);"></span> 正常</div>
-            <div class="legend-item"><span class="dot" style="background:#f59e0b;"></span> 高风险</div>
-            <div class="legend-item"><span class="dot" style="background:#ff9800;"></span> 中风险</div>
+          <h4>图例（已累加到 {{ levelLabel }}）</h4>
+          <div class="legend-item" style="opacity:0.55;"><span class="dot" style="background:#b0bec5;width:14px;border-radius:0;"></span> 第 1 步：原始轨迹</div>
+          <!-- L1 事件点从第 1 层起一直保留，是"前一层没被盖掉"的可见证据 -->
+          <div class="legend-item"><span class="dot" style="background:#ff1744;"></span> L1 事件点（high）</div>
+          <div class="legend-item"><span class="dot" style="background:#ffb74d;"></span> L1 事件点（middle）</div>
+          <template v-if="level >= 2">
+            <div class="legend-item" style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.15);">
+              <span class="dot" style="background:#0c8ce9;"></span> L2 obvious_issue
+            </div>
+            <div class="legend-item"><span class="dot" style="background:#18b8a6;"></span> L2 has_risk</div>
+            <div class="legend-item"><span class="dot" style="background:#7c6ff0;"></span> L2 needs_review</div>
+            <div class="legend-item"><span class="dot" style="background:#0f9d58;"></span> L2 normal</div>
           </template>
-          <template v-else-if="layer === 'l2'">
-            <div class="legend-item"><span class="dot" style="background:#0c8ce9;"></span> obvious_issue</div>
-            <div class="legend-item"><span class="dot" style="background:#18b8a6;"></span> has_risk</div>
-            <div class="legend-item"><span class="dot" style="background:#7c6ff0;"></span> needs_review</div>
-            <div class="legend-item"><span class="dot" style="background:#0f9d58;"></span> normal</div>
-          </template>
-          <template v-else>
-            <div class="legend-item"><span class="dot" style="background:#ea4335;"></span> high 优先级事件</div>
-            <div class="legend-item"><span class="dot" style="background:#ffb74d;"></span> middle 优先级事件</div>
-            <div class="legend-item"><span class="dot" style="background:#90a4ae;"></span> 无事件</div>
+          <template v-if="level >= 3">
+            <div class="legend-item" style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.15);">
+              <span class="dot" style="background:#f59e0b;"></span> L3 违规·高风险
+            </div>
+            <div class="legend-item"><span class="dot" style="background:#ff9800;"></span> L3 违规·中风险</div>
+            <div class="legend-item"><span class="dot" style="background:var(--violating-color,#ea4335);"></span> L3 违规（其他）</div>
           </template>
         </div>
       </div>
       <div v-if="hoverShip" class="map-hover-info" :style="hoverStyle">
         <strong>{{ hoverShip.mmsi }}</strong>
-        <span v-if="layer==='l3'">{{ hoverShip.l3Label }} · 风险 {{ hoverShip.riskLabel }} · 置信度 {{ (hoverShip.confidence*100).toFixed(0) }}%</span>
-        <span v-if="layer==='l2'">{{ hoverShip.l2Category }} · 路由 {{ hoverShip.l2Route }} · 置信度 {{ (hoverShip.l2Conf*100).toFixed(0) }}%</span>
-        <span v-if="layer==='l1'">{{ hoverShip.l1Events }}</span>
+        <span>L1：{{ hoverShip.l1Events }}</span>
+        <span v-if="level >= 2">L2：{{ hoverShip.l2Category }} · 路由 {{ hoverShip.l2Route }} · 置信度 {{ (hoverShip.l2Conf*100).toFixed(0) }}%</span>
+        <span v-if="level >= 3">L3：{{ hoverShip.l3Label }} · 风险 {{ hoverShip.riskLabel }} · 置信度 {{ (hoverShip.confidence*100).toFixed(0) }}%</span>
       </div>
       <div class="map-loading" v-if="loading"><AppIcon name="hourglass" inline /> 加载数据中...</div>
-      <div class="map-loaded" v-else><AppIcon name="check-circle" inline /> {{ trackCount }} 条轨迹</div>
+      <div class="map-loaded" v-else><AppIcon name="check-circle" inline /> 已叠到 {{ levelLabel }} · {{ ships.length }} 条轨迹 · 底层淡化 {{ rawShips.length }} 条</div>
     </div>
 
     <!-- 船舶单位统计 -->
@@ -64,43 +67,68 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import PageHeader from '../../components/PageHeader.vue'
 import AppIcon from '../../components/AppIcon.vue'
 import { useTrackMap } from '../../composables/useTrackMap.js'
-import { fetchCascadeTracks } from '../../api/ships.js'
+import { getRawTracks, getCascadeTracks } from '../../store/pipeline.js'
 
-const { mapContainer, initMap, destroyMap, drawShips, hoverShip, hoverStyle, trackCount } = useTrackMap()
+const { mapContainer, initMap, destroyMap, drawLayer, drawPoints, clearTracks,
+        fitOrKeep, hoverShip, hoverStyle } = useTrackMap()
 
+const rawShips = ref([])   // 第 1 步（原始数据）的船，作为淡化底层
 const ships = ref([])
 const summary = ref({ shipTotal: 0, l1EventTypes: [], l2Routes: [], l3Verdict: { normal: 0, violated: 0 }, l3Risk: [] })
 const shipTotal = ref(0)
-const layer = ref('l3')
+// 累加到第几层：1=L1 事件，2=+L2 路由，3=+L3 判定（默认看完整判断）
+const level = ref(3)
+const levelLabel = computed(() => ['L1 事件', 'L1＋L2 路由', 'L1＋L2＋L3 判定'][level.value - 1])
 const searchText = ref('')
 const loading = ref(true)
 let l1Chart = null, riskChart = null
 
+/**
+ * 累加着色：后一层对**它掌握信息的船**生效，其余船保留前一层的着色，
+ * 所以每多叠一层都能看出"哪些船被进一步判定了"，而不是整片换色。
+ */
 function colorOf(ship, c) {
-  if (layer.value === 'l3') {
+  // L3：被判违规的船盖成判定色；没违规的往下沿用 L2
+  if (level.value >= 3 && ship.l3?.violated) {
     const r = ship.l3?.riskLevel
-    if (ship.l3?.violated) {
-      if (r === 'high') return { color: '#f59e0b', weight: 3, opacity: 0.95 }
-      if (r === 'mid') return { color: '#ff9800', weight: 3, opacity: 0.9 }
-      return { color: c.violating || '#ea4335', weight: 3, opacity: 0.9 }
-    }
-    return { color: c.normal || '#0f9d58', weight: 2, opacity: 0.4 }
+    if (r === 'high') return { color: '#f59e0b', weight: 3, opacity: 0.95 }
+    if (r === 'mid') return { color: '#ff9800', weight: 3, opacity: 0.9 }
+    return { color: c.violating || '#ea4335', weight: 3, opacity: 0.9 }
   }
-  if (layer.value === 'l2') {
+  // L2：按 ML 路由着色
+  if (level.value >= 2) {
     const rt = ship.l2?.routing || ''
     const map = { obvious_issue: '#0c8ce9', has_risk: '#18b8a6', needs_review: '#7c6ff0' }
     return { color: map[rt] || c.normal || '#0f9d58', weight: 2, opacity: 0.6 }
   }
-  // L1: 有 high 优先级事件 → 红，有 middle → 橙，无事件 → 灰
+  // L1：有 high 优先级事件 → 红，有 middle → 橙，无事件 → 灰
   const evs = ship.l1?.events || []
   if (evs.some(e => e.priority === 'high')) return { color: '#ea4335', weight: 3, opacity: 0.9 }
   if (evs.length) return { color: '#ffb74d', weight: 2, opacity: 0.7 }
   return { color: '#90a4ae', weight: 2, opacity: 0.4 }
+}
+
+/**
+ * L1 事件点：挂在有事件的船的轨迹中点上。
+ * 这一层从第 1 层起就一直保留，是"前面叠的层不会被盖掉"的可见证据。
+ */
+function eventDots() {
+  const dots = []
+  for (const s of ships.value) {
+    const evs = s.l1?.events || []
+    if (!evs.length) continue
+    const t = s.track || []
+    if (t.length < 2) continue
+    const mid = t[Math.floor(t.length / 2)]
+    dots.push({ lng: mid.lng, lat: mid.lat,
+      color: evs.some(e => e.priority === 'high') ? '#ff1744' : '#ffb74d' })
+  }
+  return dots
 }
 function infoOf(ship) {
   const riskMap = { high: '高', mid: '中', low: '低' }
@@ -119,18 +147,40 @@ function infoOf(ship) {
 async function reload() {
   loading.value = true
   try {
-    const data = await fetchCascadeTracks()
+    // 累积叠加：本步要叠在「第 1 步 原始数据」之上，原始轨迹也得拿到
+    const [raw, data] = await Promise.all([getRawTracks(), getCascadeTracks()])
+    rawShips.value = raw?.ships || []
     summary.value = data.summary
     ships.value = data.ships
     shipTotal.value = data.summary.shipTotal || (data.ships?.length || 0)
     await nextTick()
-    drawShips(ships.value, { colorOf, infoOf, filterText: searchText.value })
+    drawCumulative()
     buildCharts()
   } catch (e) { console.error('cascade tracks load failed', e) }
   finally { loading.value = false }
 }
-function doSearch() { drawShips(ships.value, { colorOf, infoOf, filterText: searchText.value }) }
-function switchLayer(L) { layer.value = L; drawShips(ships.value, { colorOf, infoOf, filterText: searchText.value }) }
+
+/**
+ * 累积叠加：第 1 步的原始轨迹淡化铺底 → 本步按「已叠到第几层」着色的级联轨迹
+ * → L1 事件点。三层里前一层没被盖掉的部分一直留着，才看得出判断是一点点来的。
+ */
+function drawCumulative() {
+  clearTracks()
+  if (rawShips.value.length) {
+    drawLayer(rawShips.value, {
+      colorOf: () => ({ color: '#b0bec5', weight: 1, opacity: 0.14 }),
+      zIndex: 1, count: false,
+      showJumpLegs: false, showGapLegs: false, showLandPoints: false,
+    })
+  }
+  drawLayer(ships.value, { colorOf, infoOf, filterText: searchText.value, zIndex: 6 })
+  const dots = eventDots()
+  if (dots.length) drawPoints(dots, { radius: 5, opacity: 0.95, zIndex: 9 })
+  fitOrKeep()
+}
+
+function doSearch() { drawCumulative() }
+function switchLevel(n) { level.value = n; drawCumulative() }
 
 function buildCharts() {
   const l1 = summary.value.l1EventTypes || []

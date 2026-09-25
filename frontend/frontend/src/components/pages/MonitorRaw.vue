@@ -1,6 +1,6 @@
 <template>
   <div class="monitor-page">
-    <PageHeader icon="upload" title="原始数据可视化" subtitle="清洗前的轨迹点（噪声高亮） + 船舶单位清洗统计">
+    <PageHeader icon="upload" title="第 1 步 · 原始数据" subtitle="清洗前的轨迹点（噪声高亮）。这是流水线的起点，后面每一步都会把它淡化保留，只做加法">
       <button class="btn btn-primary" @click="reload"><AppIcon name="refresh-cw" inline /> 刷新</button>
     </PageHeader>
 
@@ -51,7 +51,7 @@ import * as echarts from 'echarts'
 import PageHeader from '../../components/PageHeader.vue'
 import AppIcon from '../../components/AppIcon.vue'
 import { useTrackMap } from '../../composables/useTrackMap.js'
-import { fetchRawTracks } from '../../api/ships.js'
+import { getRawTracks } from '../../store/pipeline.js'
 
 const { mapContainer, initMap, destroyMap, drawShips, drawPoints, hoverShip, hoverStyle } = useTrackMap()
 
@@ -81,7 +81,8 @@ function infoOf(ship) {
 async function reload() {
   loading.value = true
   try {
-    const data = await fetchRawTracks()
+    // 走 store：这一步是流水线起点，拉到的数据后面几步要复用（淡化铺底）
+    const data = await getRawTracks()
     summary.value = data.summary
     shipList.value = data.ships
     await nextTick()
