@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -61,6 +62,22 @@ REGULATION_COLLECTION = "regulation_articles"
 # 已装的专用 embedding 模型，768 维；集合是 1024 维，不足部分补 0（余弦不受影响）。
 EMBEDDING_MODEL = "nomic-embed-text"
 EMBEDDING_DIM = 1024  # Milvus 集合向量维度（既有集合固定为 1024）
+
+# 法规检索相似度下限：低于它的结果**丢弃**，而不是当成"检索到了"写进 regulation_ref。
+# 这是工程下限、不是法规阈值。
+#
+# 当前取值依据（2026-09 实测，语料只有 3 条区域管制规定）：
+#   不相关对（AIS 违规 ↔ 军事禁区/禁渔区/限速区）  余弦 0.49 ~ 0.59
+#   相关对  （违规捕捞 ↔ 禁渔区）                  余弦 0.63
+#   相关对  （进入禁航区 ↔ 军事禁区）              余弦 0.72
+#   自命中                                          余弦 1.00
+# 0.60 取在"实测不相关上界 0.59"之上。
+#
+# ⚠ 这个分离度**很勉强**：相关对 0.63 只比不相关上界 0.59 高 0.04。原因是语料
+# 太小且同域（都是"船舶…禁止…管制"的短中文文本，nomic 对短中文的同域基线本就
+# 偏高）。等 E:\AIS\rule\ 的法规原文入库、语料有几十上百条之后，必须按同一方法
+# 重测（取一条已知相关对与一批已知不相关对，看分离度）再定这个数。
+MIN_SIMILARITY = 0.60
 
 # 法规条目解析的正则模式
 ARTICLE_PATTERN = re.compile(
@@ -317,8 +334,16 @@ def get_embedding(text: str, model: str = EMBEDDING_MODEL) -> list[float]:
     用专用 embedding 模型（nomic-embed-text）生成语义向量；
     维度不足 EMBEDDING_DIM 时补 0（Milvus 集合固定 1024 维）。
     若模型不可用，回退到简单哈希向量（保证可运行，但检索质量较低）。
+
+    ⚠ 回退是**静默**的：哈希向量与真 nomic 向量的余弦相似度在 0.01~0.03 量级，
+    检索结果会退化成"随机返回几条"，而调用方完全看不出来。实测主机上
+    OLLAMA_HOST 指错端口时就是这个后果（HAS_OLLAMA=True 但走的是哈希分支）。
+    所以回退时会往 stderr 打警告，并置 EMBEDDING_DEGRADED 供调用方拒绝执行
+    写库类操作。
     """
+    global EMBEDDING_DEGRADED
     if not HAS_OLLAMA:
+        _warn_degraded("未安装/未启用 ollama 客户端")
         return _hash_vector(text)
 
     try:
@@ -329,11 +354,28 @@ def get_embedding(text: str, model: str = EMBEDDING_MODEL) -> list[float]:
             if len(embedding) >= EMBEDDING_DIM:
                 return embedding[:EMBEDDING_DIM]
             return embedding + [0.0] * (EMBEDDING_DIM - len(embedding))
-    except Exception:
-        pass
+        _warn_degraded("ollama 返回空向量")
+    except Exception as e:
+        _warn_degraded(f"调用 ollama embeddings 失败: {e}")
 
     # 回退：用哈希生成伪向量（保证可运行，但语义检索质量较低）
     return _hash_vector(text)
+
+
+# 是否已退化到哈希向量（供调用方判断检索结果是否可信）。单向置位，不自动复位。
+EMBEDDING_DEGRADED = False
+_degraded_warned = False
+
+
+def _warn_degraded(reason: str) -> None:
+    """回退哈希向量时告警一次（每次都打会把日志刷满）。"""
+    global EMBEDDING_DEGRADED, _degraded_warned
+    EMBEDDING_DEGRADED = True
+    if _degraded_warned:
+        return
+    _degraded_warned = True
+    print(f"[RegulationDB] ⚠ 向量化已退化为哈希伪向量（{reason}）——"
+          f"语义检索结果不可信，请检查 OLLAMA_HOST / 模型是否就绪", file=sys.stderr)
 
 
 def _hash_vector(text: str, dim: int = EMBEDDING_DIM) -> list[float]:
@@ -656,8 +698,10 @@ class RegulationDB:
 
         Returns:
             法规条目列表，每条包含 article_id/source/article_number/title/content/penalty/similarity
-            similarity 为真实余弦相似度（0~1，越大越相关；集合 metric 为 COSINE，
-            Milvus 返回的 distance = 1 - cosine，这里已换算）。
+            similarity 为真实余弦相似度（0~1，越大越相关）。集合 metric 为 COSINE，
+            **Milvus 返回的 distance 本身就是余弦相似度**（实测：同一条目用自身
+            embedding_text 检索，返回 distance≈0.00，即余弦≈1），直接取用即可，
+            不要再做 1-distance 换算。
         """
         if not self._initialized and not self._has_collection():
             return []
@@ -706,7 +750,10 @@ class RegulationDB:
                     "violation_codes": json.loads(entity.get("violation_codes", "[]")),
                     "keywords": json.loads(entity.get("keywords", "[]")),
                     "chapter": entity.get("chapter", ""),
-                    "similarity": max(0.0, round(1.0 - hit.get("distance", 0.0), 4)),
+                    # COSINE 度量下 distance 即余弦相似度，直接用。
+                    # （此前写成 1.0 - distance，把分数整个取反了：界面上"相关度27%"
+                    #   真实是 73%。排序不受影响——Milvus 已按相似度排好——所以一直没暴露。）
+                    "similarity": max(0.0, round(hit.get("distance", 0.0), 4)),
                 })
         return hits
 
@@ -715,23 +762,33 @@ class RegulationDB:
         violation_type: str,
         zone_name: Optional[str] = None,
         top_k: int = 3,
+        min_similarity: Optional[float] = None,
     ) -> list[dict[str, Any]]:
         """根据违规类型检索相关法规条目。
 
         这是 cascade 检测到违规后的主要调用入口。
 
-        策略（两级）：
+        策略（三级）：
           1. 锚定条款优先：violation_catalog.REG_ANCHORS 中人工核对过的
              （source, 条号）→ get_article 精确取出，并用真实余弦相似度排序。
              纯向量检索排序不可靠（会把无关条款排到正确条款前面），
              所以"这个违规 → 这条法规"用锚定表保证准确。
-          2. 无锚定或锚定条款不在库中 → 退回向量检索。
+          2. 锚定不在库中 → 带 violation_code 过滤的向量检索（法规条目自带
+             violation_codes 字段标明适用违规类型）。search() 早就支持这个过滤，
+             但在本次修复前**没有任何调用方传过**，等于白写。
+          3. 再退纯向量检索，并按 MIN_SIMILARITY 过滤。
+
+        第 3 步的下限是必要的：语料里只要混进与本违规无关的条目（实测库中
+        只有 3 条"军事禁区/禁渔区/港口限速"时，任何 AIS 违规查询都会返回它们），
+        没有下限就会把无关法规当成检索结果写进 regulation_ref —— 看起来像查到了，
+        实际是硬塞。宁可返回空，让调用方走兜底。
 
         Args:
             violation_type: 违规类型代码（可能是 LLM 自由输出的杂乱代码，
                 如 "AIS01"/"AIS012"，会先经 violation_catalog 归一化为规范码）
             zone_name: 可选，区域名称（用于更精确匹配）
             top_k: 返回数量
+            min_similarity: 相似度下限，None 时用模块常量 MIN_SIMILARITY
 
         Returns:
             法规条目列表（含 source/article_number/title/content/penalty/similarity）
@@ -739,6 +796,7 @@ class RegulationDB:
         raw = (violation_type or "").strip()
         if not raw:
             return []
+        floor = MIN_SIMILARITY if min_similarity is None else min_similarity
         try:
             from .violation_catalog import normalize_violation_code, describe, REG_ANCHORS
             code = normalize_violation_code(raw)
@@ -767,10 +825,19 @@ class RegulationDB:
         if not query or code == "unknown":
             return []
         qtext = f"{zone_name} {query}".strip() if zone_name else query
-        hits = self.search(qtext, top_k=top_k)
-        # 法规条目自带 violation_codes 命中规范码的排前面（提高相关性）
-        if code and code != "unknown":
-            hits.sort(key=lambda h: 0 if code in (h.get("violation_codes") or []) else 1)
+
+        hits: list[dict[str, Any]] = []
+        if code:
+            # 2a) 只用标了本违规类型的条目
+            hits = [h for h in self.search(qtext, top_k=top_k, violation_code=code)
+                    if (h.get("similarity") or 0.0) >= floor]
+        if not hits:
+            # 2b) 过滤后不足 → 纯向量检索
+            hits = [h for h in self.search(qtext, top_k=top_k)
+                    if (h.get("similarity") or 0.0) >= floor]
+            # 法规条目自带 violation_codes 命中规范码的排前面（提高相关性）
+            if code and code != "unknown":
+                hits.sort(key=lambda h: 0 if code in (h.get("violation_codes") or []) else 1)
         return hits
 
     @staticmethod

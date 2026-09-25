@@ -436,8 +436,13 @@ def dashboard_traffic_trend():
 def dashboard_violation_distribution():
     conn = get_db()
     scope_sql, scope_params = _user_scope()
+    # 优先按物化的规范码（violation_code）聚合；未回填的老记录退回原始 violation_type，
+    # 由 describe() 归一 —— 两条路径落到同一套中文标签，饼图不会出现同一类违规两个扇区。
     rows = conn.execute(
-        f"SELECT COALESCE(NULLIF(violation_type,''),'未分类') as type, COUNT(*) as count FROM detection_results WHERE violation_detected = 1{(' AND ' + scope_sql) if scope_sql else ''} GROUP BY type ORDER BY count DESC",
+        f"SELECT COALESCE(NULLIF(violation_code,''),'') as code, "
+        f"COALESCE(NULLIF(violation_type,''),'未分类') as raw_type, COUNT(*) as count "
+        f"FROM detection_results WHERE violation_detected = 1"
+        f"{(' AND ' + scope_sql) if scope_sql else ''} GROUP BY code, raw_type",
         scope_params,
     ).fetchall()
     # 违规类型归一化为中文标签再聚合（原始库里有 AIS01/AIS012 等杂乱代码）
@@ -445,7 +450,7 @@ def dashboard_violation_distribution():
         from ais_accelerator.violation_catalog import describe
         _agg: dict[str, int] = {}
         for _r in rows:
-            _label = describe(_r["type"] or "")["label"]
+            _label = describe(_r["code"] or _r["raw_type"] or "")["label"]
             _agg[_label] = _agg.get(_label, 0) + _r["count"]
         rows = [{"type": k, "count": v} for k, v in sorted(_agg.items(), key=lambda kv: -kv[1])]
     except Exception:
@@ -1033,37 +1038,49 @@ def cascade_ship_tracks():
 @app.route("/api/v1/violations/catalog")
 @login_required
 def violations_catalog():
-    """返回违规类型二级目录（类目 → 类型列表），供前端饼图下钻与筛选下拉动态拉取。
+    """返回违规类型三级目录（类目 → 类型 → 细类），供前端下钻与筛选下拉动态拉取。
 
-    返回的 types 中每项含当前用户范围内的违规船舶数量（count），
+    返回的 types / subtypes 中每项含当前用户范围内的违规船舶数（去重 MMSI），
     方便前端直接渲染带数量的目录。
+
+    细类放在**独立**的 subtypes[]（扁平全量）**以及** types[].subtypes（各自归属）
+    两处：前者给"全部细类"下拉用，后者给「类目→类型→细类」三级联动用。
     """
     conn = get_db()
     scope_sql, scope_params = _user_scope()
 
-    # 按规范码聚合，统计违规船舶数（去重 MMSI）
+    # 优先按物化的规范码/细类聚合；未回填的老记录（两列皆空）退回原始 violation_type，
+    # 由 normalize_violation_code() 在 Python 侧归一，两条路径的结果合并计数。
     rows = conn.execute(f"""
-        SELECT COALESCE(NULLIF(violation_type,''),'unknown') as raw_type,
+        SELECT COALESCE(NULLIF(violation_code,''),'') as code,
+               COALESCE(NULLIF(violation_type,''),'unknown') as raw_type,
+               COALESCE(NULLIF(violation_subtype,''),'') as subtype,
                COUNT(DISTINCT mmsi) as ship_count,
                COUNT(*) as event_count
         FROM detection_results
         WHERE violation_detected = 1{(' AND ' + scope_sql) if scope_sql else ''}
-        GROUP BY raw_type
+        GROUP BY code, raw_type, subtype
     """, scope_params).fetchall()
     conn.close()
 
     from ais_accelerator.violation_catalog import (
-        normalize_violation_code, list_catalog, CATEGORY_MAP,
+        normalize_violation_code, list_catalog,
     )
 
-    # 聚合到规范码
+    def _bump(bucket: dict, key: str, ship: int, event: int) -> None:
+        if key not in bucket:
+            bucket[key] = {"ship_count": 0, "event_count": 0}
+        bucket[key]["ship_count"] += ship
+        bucket[key]["event_count"] += event
+
+    # 聚合到规范码 / 细类
     code_agg: dict[str, dict] = {}
+    sub_agg: dict[str, dict] = {}
     for r in rows:
-        code = normalize_violation_code(r["raw_type"])
-        if code not in code_agg:
-            code_agg[code] = {"ship_count": 0, "event_count": 0}
-        code_agg[code]["ship_count"] += r["ship_count"]
-        code_agg[code]["event_count"] += r["event_count"]
+        code = r["code"] or normalize_violation_code(r["raw_type"])
+        _bump(code_agg, code, r["ship_count"], r["event_count"])
+        if r["subtype"]:
+            _bump(sub_agg, r["subtype"], r["ship_count"], r["event_count"])
 
     catalog = list_catalog()
     # 类目统计
@@ -1073,10 +1090,19 @@ def violations_catalog():
                                 "ship_count": 0, "event_count": 0, "type_count": 0}
 
     types_out = []
+    subtypes_flat = []
     for t in catalog["types"]:
         code = t["code"]
         agg = code_agg.get(code, {"ship_count": 0, "event_count": 0})
-        item = {**t, "ship_count": agg["ship_count"], "event_count": agg["event_count"]}
+        # 填上各细类的实际数量（静态定义来自 list_subtypes()，此处只补计数）
+        subs = []
+        for s in t.get("subtypes", []):
+            sa = sub_agg.get(s["code"], {"ship_count": 0, "event_count": 0})
+            item = {**s, "ship_count": sa["ship_count"], "event_count": sa["event_count"]}
+            subs.append(item)
+            subtypes_flat.append({**item, "type_code": code, "type_label": t["label"]})
+        item = {**t, "subtypes": subs,
+                "ship_count": agg["ship_count"], "event_count": agg["event_count"]}
         types_out.append(item)
         cat = t.get("category", "other")
         if cat in cat_stats:
@@ -1094,7 +1120,7 @@ def violations_catalog():
             "type_count": s["type_count"],
         })
 
-    return ok({"categories": categories_out, "types": types_out})
+    return ok({"categories": categories_out, "types": types_out, "subtypes": subtypes_flat})
 
 
 @app.route("/api/v1/ships/speed-stats")
@@ -1127,23 +1153,131 @@ def ships_speed_stats():
 # 4. 违规管理（从 detection_results 查询）
 # ═══════════════════════════════════════════════════════════
 
+# _norm_key()（ais_accelerator/violation_catalog.py）的 SQL 版：小写、空白/连字符/
+# 点/斜杠 → 下划线。用途是让"未回填 violation_code 的老行"也能按类型筛选——
+# 那些行的 violation_type 存的是 LLM 原始输出（AIS002 / AIS-GAP / ais off …），
+# 要跟 raw_aliases() 给出的规范键对齐就必须先做同一套归一化。
+# 注：_norm_key 还会折叠连续下划线并入全角斜杠，这里略去——存量数据里没有这两种形态。
+_NORM_RAW_SQL = (
+    "REPLACE(REPLACE(REPLACE(REPLACE(LOWER(COALESCE(violation_type,'')),"
+    "' ','_'),'-','_'),'.','_'),'/','_')"
+)
+
+# recommended_action 是 LLM 输出契约里的**枚举**（见 llm_layer/prompts.py:106
+# "auto_alert/manual_review/monitor"），不是给人读的句子。直接渲染会出现
+# 「建议处置：auto_alert」这种无意义文案 —— 枚举翻译成中文再显示。
+_ACTION_LABEL = {
+    "auto_alert": "自动告警",
+    "manual_review": "人工复核",
+    "monitor": "持续监控",
+}
+
+
+def _action_label(value: str) -> str:
+    """处置枚举 → 中文标签；认不出的原样返回（不吞数据）。"""
+    v = (value or "").strip()
+    return _ACTION_LABEL.get(v, v)
+
+
 @app.route("/api/v1/violations")
 @login_required
 def violations_list():
-    vtype = request.args.get("type", "")
-    page = int(request.args.get("page", 1))
-    page_size = int(request.args.get("pageSize", 50))
+    """违规记录列表。支持 类目 / 类型 / 细类 / 关键词 筛选 + 真分页。
 
-    conn = get_db()
+    筛选**下推到 SQL**：此前是无 LIMIT 取回全表、再在 Python 里逐行 `continue`，
+    total 只能靠遍历计数，翻页也等于全表重算。现在 COUNT 与分页各一条查询。
+
+    三级筛选的关系是**求交**（category ∩ type），所以「类目=AIS设备类 且
+    类型=进入禁航区」这种矛盾组合会正确地返回 0 条，而不是退化成不过滤。
+    """
+    vtype = (request.args.get("type") or "").strip()
+    vcat = (request.args.get("category") or "").strip()
+    vsub = (request.args.get("subtype") or "").strip()
+    search = (request.args.get("search") or "").strip()
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        page_size = max(1, min(int(request.args.get("pageSize", 50)), 200))
+    except (TypeError, ValueError):
+        page_size = 50
+
+    # 违规类型规范化（中文标签/含义/规范码），依赖顶层 ai 包，失败则原样展示
+    try:
+        from ais_accelerator.violation_catalog import (
+            describe_full, build_violation_event, normalize_violation_code,
+            raw_aliases, codes_of_category, code_of_label, describe_subtype,
+            resolve_subtype,
+        )
+        _cat_ok = True
+    except Exception:
+        _cat_ok = False
+
+    conds = ["violation_detected = 1"]
+    params: list = []
+
+    # 全员数据隔离：只看自己上传的 + system 全局数据（_user_scope 的约定：
+    # 已有 WHERE 的查询在条件末尾拼 AND，参数追加在原有参数之后）
     scope_sql, scope_params = _user_scope()
-    where = ["violation_detected = 1"]
-    params = []
     if scope_sql:
-        where.append(scope_sql)
+        conds.append(scope_sql)
         params.extend(scope_params)
-    sql_where = " AND ".join(where)
+
+    if _cat_ok:
+        # 类目与类型都收敛成"一组规范码"，两者求交
+        code_set = None
+        if vtype:
+            code = normalize_violation_code(vtype)
+            if code == "unknown":
+                code = code_of_label(vtype)     # 前端下拉传的是中文标签
+            code_set = {code} if code != "unknown" else set()
+        if vcat:
+            cat_codes = set(codes_of_category(vcat))
+            code_set = cat_codes if code_set is None else (code_set & cat_codes)
+
+        if code_set is not None:
+            if not code_set:
+                conds.append("1=0")             # 认不出的筛选条件 → 0 条，别退化成不过滤
+            else:
+                codes = sorted(code_set)
+                aliases = sorted({a for c in codes for a in raw_aliases(c)})
+                # 物化码优先命中；未回填的老行（violation_code 为空）按归一化后的
+                # 原始 violation_type 匹配 —— _NORM_RAW_SQL 是 _norm_key() 的 SQL 版
+                conds.append(
+                    f"(violation_code IN ({','.join('?' * len(codes))}) OR "
+                    f"(COALESCE(violation_code,'')='' AND "
+                    f"{_NORM_RAW_SQL} IN ({','.join('?' * len(aliases))})))"
+                )
+                params.extend(codes)
+                params.extend(aliases)
+
+        if vsub:
+            # 允许只传细类键（suspected_off）或完整细类码（ais_gap#suspected_off）——
+            # 裸键自带唯一归属，由 resolve_subtype() 补全父类型，不需要调用方先选类型
+            sub = resolve_subtype(vsub)
+            # 细类只能由 detailed_result 里的实测量级算出、无法在 SQL 里现算，
+            # 所以只匹配已回填的行（未回填的行 violation_subtype 为空）
+            if not sub:
+                conds.append("1=0")     # 认不出的细类 → 0 条，别退化成不过滤
+            else:
+                conds.append("violation_subtype = ?")
+                params.append(sub)
+
+    if search:
+        kw = f"%{search.lower()}%"
+        conds.append("(LOWER(mmsi) LIKE ? OR LOWER(COALESCE(violation_label,'')) LIKE ? "
+                     "OR LOWER(COALESCE(final_assessment,'')) LIKE ?)")
+        params.extend([kw, kw, kw])
+
+    where_sql = " AND ".join(conds)
+    conn = get_db()
+    total = conn.execute(
+        f"SELECT COUNT(*) as n FROM detection_results WHERE {where_sql}", params
+    ).fetchone()["n"]
     rows = conn.execute(f"""
-        SELECT id, mmsi, violation_type, risk_level,
+        SELECT id, mmsi, violation_type, violation_code, violation_subtype,
+               violation_metric, risk_level,
                final_assessment as violation_desc,
                recommended_action as ai_suggestion,
                regulation_ref as regulation_ref,
@@ -1151,33 +1285,32 @@ def violations_list():
                violation_event as violation_event,
                quality_level,
                analysis_time as created_at
-        FROM detection_results WHERE {sql_where}
-        ORDER BY analysis_time DESC
-    """, params).fetchall()
+        FROM detection_results WHERE {where_sql}
+        ORDER BY analysis_time DESC, id DESC
+        LIMIT ? OFFSET ?
+    """, params + [page_size, (page - 1) * page_size]).fetchall()
     conn.close()
-
-    # 违规类型规范化（中文标签/含义/规范码），依赖顶层 ai 包，失败则原样展示
-    try:
-        from ais_accelerator.violation_catalog import describe, build_violation_event
-        _cat_ok = True
-    except Exception:
-        _cat_ok = False
 
     tag_map = {"high": "danger", "mid": "warning", "middle": "warning", "low": "info"}
     vlist = []
     for r in rows:
         raw_type = r["violation_type"] or ""
+        mat_code = r["violation_code"] or ""
         if _cat_ok:
-            info = describe(raw_type)
+            info = describe_full(mat_code or raw_type)
             label, code, meaning = info["label"], info["code"], info["meaning"]
+            cat, cat_label = info["category"], info["category_label"]
         else:
-            label, code, meaning = raw_type or "未分类", raw_type or "", ""
-        # 类型筛选：匹配 中文标签 / 规范码 / 原始代码（任一命中）
-        if vtype and not any(
-            vtype.lower() == x.lower()
-            for x in (raw_type, code, label)
-        ):
-            continue
+            label, code, meaning = raw_type or "未分类", mat_code or raw_type or "", ""
+            cat, cat_label = "other", "其他"
+
+        # 三级细类（量级分档）：标签从静态定义反查，实测量值直接读物化列
+        sub_code = r["violation_subtype"] or ""
+        sub_label, sub_unit = "", ""
+        if _cat_ok and sub_code:
+            _si = describe_subtype(sub_code)
+            sub_label, sub_unit = _si["label"], _si["unit"]
+
         reg_ref = r["regulation_ref"] or ""
         event = r["violation_event"] or ""
         if not event and _cat_ok:
@@ -1194,19 +1327,23 @@ def violations_list():
             "violationCode": code,           # 规范码
             "violationMeaning": meaning,     # 含义解释
             "rawType": raw_type,             # 原始代码（可查）
+            "category": cat,                 # 一级类目
+            "categoryLabel": cat_label,
+            "subtype": sub_code,             # 三级细类（如 ais_gap#suspected_off）
+            "subtypeLabel": sub_label,       # 如 "疑似关闭"
+            "subtypeUnit": sub_unit,         # 如 "分钟"
+            "metric": r["violation_metric"] or 0,   # 定档依据的实测量值
             "tagType": tag_map.get(r["risk_level"], "info"),
             # 归一化风险等级：兼容旧数据 'middle' → 'mid'，确保前端标签一致
             "riskLevel": "mid" if (r["risk_level"] or "").lower() == "middle" else (r["risk_level"] or "low"),
             "description": event or r["violation_desc"],   # 可读违规事件
             "regulationRef": reg_ref,
-            "aiSuggestion": r["ai_suggestion"] or r["violation_desc"],
+            # 只放处置枚举（翻译后），不回退到正文 —— 正文已经在 description 里了
+            "aiSuggestion": _action_label(r["ai_suggestion"]),
             "qualityLevel": r["quality_level"] or "good",
         })
 
-    total = len(vlist)
-    start = (page - 1) * page_size
-    end = start + page_size
-    return ok({"total": total, "list": vlist[start:end]})
+    return ok({"total": total, "list": vlist, "page": page, "pageSize": page_size})
 
 
 @app.route("/api/v1/violations/<int:vid>")
@@ -1261,6 +1398,7 @@ def violation_evidence(vid):
     conn = get_db()
     r = conn.execute(
         f"SELECT ml_category, ml_confidence, routing, violation_label, violation_event, "
+        f"violation_code, violation_subtype, violation_metric, "
         f"regulation_ref, recommended_action, final_assessment, detailed_result, risk_level "
         f"FROM detection_results WHERE id = ? AND violation_detected = 1"
         f"{(' AND ' + scope_sql) if scope_sql else ''}",
@@ -1295,11 +1433,22 @@ def violation_evidence(vid):
             "detail": f"分类 {r['ml_category'] or '-'}",
             "ok": bool(r["routing"]),
         })
-        # L3：LLM 判定
+        # L3：LLM 判定（带上三级细类与定档依据的实测量值 —— "为什么是这个细类"）
+        l3_label = r["violation_label"] or data['verdict']['violation_label']
+        l3_detail = (r["final_assessment"] or "")[:120]
+        try:
+            from ais_accelerator.violation_catalog import describe_subtype
+            _si = describe_subtype(r["violation_subtype"] or "")
+            if _si["label"]:
+                _m = r["violation_metric"] or 0
+                l3_label = f"{l3_label} · {_si['label']}"
+                l3_detail = (f"实测{_si['label']}依据：{_m:.1f}{_si['unit']}；{l3_detail}").strip("；")
+        except Exception:
+            pass
         chain.append({
             "stage": "L3", "name": "LLM 判定",
-            "summary": f"违规：{r['violation_label'] or data['verdict']['violation_label']}",
-            "detail": (r["final_assessment"] or "")[:120],
+            "summary": f"违规：{l3_label}",
+            "detail": l3_detail,
             "ok": True,
         })
         # 法规
@@ -1313,7 +1462,7 @@ def violation_evidence(vid):
         chain.append({
             "stage": "ACT", "name": "处置建议",
             "summary": "已生成" if (r["recommended_action"] or "").strip() else "无建议",
-            "detail": (r["recommended_action"] or "")[:120],
+            "detail": _action_label(r["recommended_action"])[:120],
             "ok": bool((r["recommended_action"] or "").strip()),
         })
 
@@ -2528,6 +2677,12 @@ CREATE INDEX IF NOT EXISTS idx_orgmember_user ON org_members(user_id);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT DEFAULT '';
 ALTER TABLE detection_results ADD COLUMN IF NOT EXISTS violation_label TEXT DEFAULT '';
 ALTER TABLE detection_results ADD COLUMN IF NOT EXISTS violation_event TEXT DEFAULT '';
+-- 三级分类（大类→类型→细类）物化列，由 violation_catalog.classify() 写入。
+-- 必须与 scripts/backfill_violation_taxonomy.py 的 NEW_COLUMNS 保持一致，
+-- 否则容器重建后新库缺列、违规接口 500。
+ALTER TABLE detection_results ADD COLUMN IF NOT EXISTS violation_code TEXT DEFAULT '';
+ALTER TABLE detection_results ADD COLUMN IF NOT EXISTS violation_subtype TEXT DEFAULT '';
+ALTER TABLE detection_results ADD COLUMN IF NOT EXISTS violation_metric DOUBLE PRECISION DEFAULT 0;
 """
 
 

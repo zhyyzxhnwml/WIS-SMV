@@ -525,6 +525,14 @@ def process_file(csv_path: str):  # csv_path: CSV文件路径
                     recommended_action TEXT DEFAULT '',
                     final_assessment TEXT DEFAULT '',
                     regulation_ref TEXT DEFAULT '',
+                    -- 下面五列与 app.py 的 DB_TABLES_SQL 保持一致。此前这份 DDL 少了
+                    -- violation_label / violation_event，而下面的 INSERT 又写了它们 ——
+                    -- 表由本文件创建时（全新库 + 直接跑 CLI）INSERT 会因缺列直接失败。
+                    violation_label TEXT DEFAULT '',
+                    violation_event TEXT DEFAULT '',
+                    violation_code TEXT DEFAULT '',
+                    violation_subtype TEXT DEFAULT '',
+                    violation_metric DOUBLE PRECISION DEFAULT 0,
                     llm_latency_seconds DOUBLE PRECISION DEFAULT 0,
                     detailed_result TEXT DEFAULT '{}'
                 )
@@ -546,13 +554,17 @@ def process_file(csv_path: str):  # csv_path: CSV文件路径
                      ml_category, ml_confidence, routing, ml_probabilities,
                      violation_detected, violation_type, risk_level, confidence,
                      recommended_action, final_assessment, regulation_ref,
-                     violation_label, violation_event, llm_latency_seconds, detailed_result)
+                     violation_label, violation_event,
+                     violation_code, violation_subtype, violation_metric,
+                     llm_latency_seconds, detailed_result)
                 VALUES (?, ?, ?,
                         ?,?,?,?,?,?,
                         ?,?,?,?,
                         ?,?,?,?,
                         ?,?,?,
-                        ?,?,?,?)
+                        ?,?,
+                        ?,?,?,
+                        ?,?)
             """, (
                 ship.mmsi,
                 CURRENT_USER_ID,
@@ -573,6 +585,11 @@ def process_file(csv_path: str):  # csv_path: CSV文件路径
                 (llm_result.get("regulation_ref", "") or ""),
                 (llm_result.get("violation_label", "") or "")[:100],
                 (llm_result.get("violation_event", "") or "")[:500],
+                # 三级分类（orchestrator 的 classify() 产出）：二级规范码 / 三级细类 /
+                # 定档依据的实测量值。缺失时落空，接口层会退回按 violation_type 归一。
+                (llm_result.get("violation_code", "") or "")[:64],
+                (llm_result.get("violation_subtype", "") or "")[:64],
+                llm_result.get("violation_metric", 0) or 0,
                 llm_result.get("latency_seconds", 0),
                 json.dumps(entry, ensure_ascii=False, default=str),
             ))

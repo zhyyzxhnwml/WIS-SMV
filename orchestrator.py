@@ -353,21 +353,37 @@ class EndToEndOrchestrator:
 
         # ── 关联具体法规条款（用于违规监控展示） ──
         # regulation_db 已注入法规上下文到 prompt；这里再为违规类型生成
-        # 规范码/中文标签/法规引用/可读违规事件，供前端展示。
+        # 规范码/中文标签/三级细类/法规引用/可读违规事件，供前端展示。
         if self.regulation_db and llm_result.get("violation_detected"):
             try:
                 from ais_accelerator.violation_catalog import (
-                    normalize_violation_code, describe, FALLBACK_REG, build_violation_event,
+                    classify, FALLBACK_REG, build_violation_event,
                 )
-                # LLM 自由输出的 violation_type 很乱（AIS01/AIS012/...），
-                # 检索前先归一化为规范码；为空时退回 L1 事件类型（scenario）。
+                # L1 事件是**实测证据**，classify() 以它的 candidate_type 为准
+                # （优先于 LLM 自由输出的 violation_type —— 后者是 AIS01/AIS012/
+                #  data_quality_non_increasing_time 这类杂乱值，实测同一批数据里
+                #  42 条违规的 L1 事件 100% 是 ais_gap，而 LLM 输出了十余种写法）。
+                # 三级细类由 features 里的实测量级定档（如 ais_gap#suspected_off）。
+                _events = []
+                for _ev in (track.events or []):
+                    _ct = (_ev.candidate_type.value
+                           if hasattr(_ev.candidate_type, "value")
+                           else str(_ev.candidate_type))
+                    _events.append({
+                        "candidate_type": _ct,
+                        "features": dict(getattr(_ev, "features", None) or {}),
+                    })
+                # 无 L1 事件时退回 scenario（加速器标注出的类型），仍优于纯 LLM 输出
                 _vtype = (llm_result.get("violation_type", "") or scenario or "").strip()
-                _code = normalize_violation_code(_vtype)
-                _info = describe(_code)
+                _info = classify(_vtype, _events)
+                _code = _info["code"]
                 llm_result["violation_code"] = _code
                 llm_result["violation_label"] = _info["label"]
+                llm_result["violation_subtype"] = _info["subtype"]
+                llm_result["violation_metric"] = _info["metric"] or 0
 
-                _arts = self.regulation_db.search_by_violation(_vtype, zone, top_k=3)
+                # 用**规范码**检索（不是 LLM 的脏码）：检索词取该码的中文含义
+                _arts = self.regulation_db.search_by_violation(_code, zone, top_k=3)
                 _best = _arts[0] if _arts else None
                 if _arts:
                     _refs = []
@@ -386,10 +402,12 @@ class EndToEndOrchestrator:
                         _refs.append(_ref)
                     llm_result["regulation_ref"] = "；".join(_refs[:3])
                 else:
-                    # 无检索结果 → 目录兜底引用（保证每条违规都有法规）
+                    # 检索为空（含"相似度低于门槛被丢弃"）→ 目录兜底引用
+                    # 注：兜底文本是"该违规适用什么规则"的通用陈述，不是伪造的法条号；
+                    # 回填脚本的 --fix-regulation 更保守（宁可不写），两者口径不同是有意的。
                     llm_result["regulation_ref"] = FALLBACK_REG.get(_code, FALLBACK_REG.get("unknown", ""))
                 llm_result["violation_event"] = build_violation_event(
-                    _vtype,
+                    _code,
                     llm_result.get("final_assessment", "") or "",
                     llm_result.get("regulation_ref", "") or "",
                     _best,

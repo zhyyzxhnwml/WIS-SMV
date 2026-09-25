@@ -73,6 +73,75 @@ def _build_gap_context(ev: dict, raw_track: list) -> Optional[dict]:
     }
 
 
+def _index_of_ts(track: list, ts: str) -> Optional[int]:
+    """在轨迹里找某个时间戳的下标（找不返回 None）。"""
+    if not ts:
+        return None
+    for i, p in enumerate(track):
+        if (p.get("timestamp") or p.get("time") or "") == ts:
+            return i
+    return None
+
+
+def _shift_iso(iso: str, minutes: float) -> str:
+    """ISO 时间平移若干分钟；解析失败返回空串。"""
+    dt = _parse_iso(iso)
+    if dt is None:
+        return ""
+    from datetime import timedelta
+    return (dt + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _speeds_in_window(track: list, start_iso: str, end_iso: str):
+    """[start, end] **内部**（不含两端）轨迹点的 (平均, 最高) 航速。
+
+    区间内取不到点 → (None, None)。AIS 中断类事件必然落进这一支：空档里本来
+    就没有点 —— 而那正是"中断"这件事本身的证明。
+    """
+    if not start_iso or not end_iso:
+        return None, None
+    vals = []
+    for p in track:
+        ts = p.get("timestamp") or p.get("time") or ""
+        if start_iso < ts < end_iso:
+            try:
+                vals.append(float(p.get("speed")))
+            except (TypeError, ValueError):
+                continue
+    if not vals:
+        return None, None
+    return round(sum(vals) / len(vals), 1), round(max(vals), 1)
+
+
+def _speeds_around(track: list, pre_iso: str, post_iso: str, n: int = 20):
+    """空档两侧各取 n 个点的 (平均, 最高) 航速。
+
+    features 里没有速度字段、区间内又取不到点时用它兜底：取"信号消失前最后
+    n 个点 + 恢复后最初 n 个点"，回答的是"它消失时和在做什么"。返回值会带上
+    speed_scope='context'，让前端如实标注口径，不冒充"区间均速"。
+    """
+    if not track:
+        return None, None
+    i_pre = _index_of_ts(track, pre_iso)
+    i_post = _index_of_ts(track, post_iso)
+    if i_pre is None and i_post is None:
+        return None, None
+    idxs: list[int] = []
+    if i_pre is not None:
+        idxs += range(max(0, i_pre - n + 1), i_pre + 1)
+    if i_post is not None:
+        idxs += range(i_post, min(len(track), i_post + n))
+    vals = []
+    for i in sorted(set(idxs)):
+        try:
+            vals.append(float(track[i].get("speed")))
+        except (TypeError, ValueError):
+            continue
+    if not vals:
+        return None, None
+    return round(sum(vals) / len(vals), 1), round(max(vals), 1)
+
+
 def build_evidence_data(mmsi: str, row: dict, detail: dict) -> dict:
     """构建结构化证据数据（EvidenceCard 渲染契约）。
 
@@ -100,19 +169,66 @@ def build_evidence_data(mmsi: str, row: dict, detail: dict) -> dict:
         except (TypeError, ValueError):
             return d
 
+    def _opt_num(v):
+        """同 _num，但字段缺失返回 None —— 0.0 与"没有这个量"在界面上必须分得开。"""
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
     ev_list = []
     for ev in events[:10]:
         evpts = ev.get("evidence_points") or []
         feats = ev.get("features") or {}
+        gap_ctx = _build_gap_context(ev, raw_track)
+        gap_min = _opt_num((gap_ctx or {}).get("gap_minutes"))
+
+        post_pt = (gap_ctx or {}).get("post_point") or {}
+        pre_pt = (gap_ctx or {}).get("pre_point") or {}
+        post_iso = post_pt.get("timestamp") or post_pt.get("time") or ""
+        pre_iso = pre_pt.get("timestamp") or pre_pt.get("time") or ""
+
+        start_iso = (ev.get("start_time") or "").strip()
+        end_iso = (ev.get("end_time") or "").strip()
+        if gap_ctx:
+            # 中断类事件的 start/end 是**退化**的：两者都等于"信号恢复时刻"，
+            # 界面上就成了 "20:17 ~ 20:17"。真实起点优先取中断前最后一个实测点
+            # （pre_point.timestamp），取不到再按 "恢复时刻 − 中断时长" 反推。
+            end_iso = post_iso or end_iso
+            start_iso = pre_iso or _shift_iso(post_iso, -(gap_min or 0.0)) or start_iso
+
+        # 持续时长：中断类事件的 features 里**只有 gap_minutes、没有 duration_minutes**，
+        # 直接取会显示"持续 0 分"（真实 680 分）
+        dur = _opt_num(feats.get("duration_minutes"))
+        if (dur is None or dur <= 0) and gap_min:
+            dur = gap_min
+
+        # 航速：中断类事件的 features 里同样没有速度字段，取不到就显示 0.0 节（假数据）。
+        # 依次尝试 features → 区间内实测 → 空档两侧 n 点，都取不到才留 None（前端显示 '-'）
+        avg_sp = _opt_num(feats.get("average_speed"))
+        max_sp = _opt_num(feats.get("max_speed"))
+        speed_scope = ""
+        if avg_sp is None and max_sp is None:
+            avg_sp, max_sp = _speeds_in_window(raw_track, start_iso, end_iso)
+            if avg_sp is not None or max_sp is not None:
+                speed_scope = "window"
+            else:
+                avg_sp, max_sp = _speeds_around(raw_track, pre_iso, post_iso)
+                speed_scope = "context" if avg_sp is not None else ""
+
         entry = {
             "type": ev.get("candidate_type") or "",
             "type_label": _describe_code(ev.get("candidate_type") or ""),
             "zone_name": ev.get("zone_name") or ev.get("zone_id") or "未知区域",
-            "start_time": _fmt_time(ev.get("start_time")),
-            "end_time": _fmt_time(ev.get("end_time")),
-            "avg_speed": _num(feats.get("average_speed")),
-            "max_speed": _num(feats.get("max_speed")),
-            "duration_minutes": _num(feats.get("duration_minutes")),
+            "start_time": _fmt_time(start_iso),
+            "end_time": _fmt_time(end_iso),
+            # 完整 ISO：前端画时间轴要靠它算绝对时刻，_fmt_time 只到分钟、也不带年份
+            "start_ts": start_iso,
+            "end_ts": end_iso,
+            "avg_speed": avg_sp,
+            "max_speed": max_sp,
+            "speed_scope": speed_scope,
+            "duration_minutes": dur,
             "evidence_points": [
                 {
                     "lat": p.get("lat"), "lon": p.get("lon"),
@@ -121,7 +237,6 @@ def build_evidence_data(mmsi: str, row: dict, detail: dict) -> dict:
                 } for p in evpts
             ],
         }
-        gap_ctx = _build_gap_context(ev, raw_track)
         if gap_ctx:
             entry["gap_minutes"] = gap_ctx["gap_minutes"]
             entry["pre_point"] = gap_ctx["pre_point"]
