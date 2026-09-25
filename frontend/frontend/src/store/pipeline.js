@@ -10,7 +10,7 @@
  *
  * 需要强制重取时调 resetPipeline()（例如用户点了「刷新」按钮）。
  */
-import { fetchShips, fetchRawTracks, fetchCascadeTracks } from '../api/ships'
+import { fetchRawTracks, fetchCascadeTracks } from '../api/ships'
 import { get } from '../api/request'
 
 let cache = {}
@@ -26,14 +26,16 @@ function memo(key, fn) {
 /** 原始数据：每船 rawTrack（带 quality flags）+ 船舶单位清洗统计。 */
 export function getRawTracks() { return memo('raw', fetchRawTracks) }
 
-/** 清洗后：/ships 列表，每船 track（保留点）。返回 { total, list }。 */
-export function getCleanedShips() { return memo('cleaned', () => fetchShips()) }
+/**
+ * 清洗后：/ships/all-tracks，每船 track（保留点，带 tags / 陆地标记）。
+ *
+ * 这里刻意不用 /ships：那个接口只返回 mmsi/速度这类摘要，**不带 track 字段**
+ * （画不出线），而且 pageSize 默认 50，一次只给前 50 条船。画轨迹必须走这个。
+ */
+export function getAllTracks() { return memo('all', () => get('/ships/all-tracks')) }
 
 /** 级联判断后：每船 track + l1/l2/l3。 */
 export function getCascadeTracks() { return memo('cascade', fetchCascadeTracks) }
-
-/** 最终结果：全部轨迹（含 tags / onLand / crossesLand / 违规着色）。返回数组。 */
-export function getAllTracks() { return memo('all', () => get('/ships/all-tracks')) }
 
 export function resetPipeline() { cache = {} }
 

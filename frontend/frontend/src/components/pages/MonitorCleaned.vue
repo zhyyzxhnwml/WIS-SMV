@@ -59,7 +59,7 @@ import * as echarts from 'echarts'
 import PageHeader from '../../components/PageHeader.vue'
 import AppIcon from '../../components/AppIcon.vue'
 import { useTrackMap } from '../../composables/useTrackMap.js'
-import { getRawTracks, getCleanedShips } from '../../store/pipeline.js'
+import { getRawTracks, getAllTracks, byMmsi } from '../../store/pipeline.js'
 
 const { mapContainer, initMap, destroyMap, drawLayer, drawPoints, clearTracks,
         fitOrKeep, hoverShip, hoverStyle } = useTrackMap()
@@ -73,10 +73,10 @@ const qlStats = ref({})
 let compareChart = null, qlChart = null
 
 function colorOf(ship, c) {
-  const avg = ship.avgSpeed || ship.avg_speed || 0
-  if (ship.violated) return { color: c.violating || '#ea4335', weight: 3, opacity: 0.9 }
-  if (avg > 15) return { color: '#ea4335', weight: 2, opacity: 0.8 }
-  if (avg < 1) return { color: c.anchored || '#f59e0b', weight: 2, opacity: 0.8 }
+  // all-tracks 已经把速度/违规折算成 color 了（violating/red/yellow/green），直接用
+  if (ship.violated || ship.color === 'violating') return { color: c.violating || '#ea4335', weight: 3, opacity: 0.9 }
+  if (ship.color === 'red') return { color: '#ea4335', weight: 2, opacity: 0.8 }
+  if (ship.color === 'yellow') return { color: c.anchored || '#f59e0b', weight: 2, opacity: 0.8 }
   return { color: c.normal || '#0f9d58', weight: 2, opacity: 0.4 }
 }
 function infoOf(ship) {
@@ -96,10 +96,13 @@ async function reload() {
   try {
     // 累积叠加：本步要叠在「原始数据」之上，所以原始轨迹和噪声点也得拿到
     // （store 里按 promise 记忆，上一步已经拉过就直接复用，不会重复请求）
-    const [raw, data] = await Promise.all([getRawTracks(), getCleanedShips()])
+    //
+    // 本步的轨迹取 /ships/all-tracks，不能用 /ships：后者既不带 track 字段
+    // （画不出线），又多取一处 pageSize 默认只有 50 的分页，只画得出前 50 条船。
+    const [raw, list] = await Promise.all([getRawTracks(), getAllTracks()])
     rawShips.value = raw?.ships || []
-    shipTotal.value = data.total || 0
-    ships.value = data.list || []
+    ships.value = list || []
+    shipTotal.value = ships.value.length
     await nextTick()
     drawCumulative()
     computeQualityStats()
@@ -142,11 +145,15 @@ function qlLabel(l) { return l === 'good' ? '良好' : l === 'fair' ? '一般' :
 function computeQualityStats() {
   const counts = { good: 0, fair: 0, poor: 0 }
   let origSum = 0, retSum = 0, n = 0
+  // 点数对比是船舶单位的：原始/保留点数在 /ships/raw-tracks 的每船 stats 里，
+  // 按 mmsi 对到本步的船上（两边都来自同一份检测结果，mmsi 能对上）
+  const rawBy = byMmsi(rawShips.value)
   for (const s of ships.value) {
     const ql = s.qualityLevel || 'good'
     counts[ql in counts ? ql : 'good']++
-    origSum += s.originalPoints || s.stats?.originalPoints || 0
-    retSum += s.retainedPoints || s.stats?.retainedPoints || s.track?.length || 0
+    const st = rawBy.get(String(s.mmsi))?.stats
+    origSum += st?.originalPoints || 0
+    retSum += st?.retainedPoints || 0
     n++
   }
   qlStats.value = {
