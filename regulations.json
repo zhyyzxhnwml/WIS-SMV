@@ -1,0 +1,79 @@
+{
+  "meta": {
+    "description": "船舶违规检测规则库 - 样例数据",
+    "version": "2.0.0",
+    "note": "违规类型定义已迁移到法规向量数据库（RegulationDB），本文件仅保留区域和船舶类型定义"
+  },
+  "zones": [
+    {
+      "id": "no_fishing_zone_A",
+      "name": "禁渔区A",
+      "type": "fishing_protected",
+      "boundary": [
+        [121.50, 38.00],
+        [121.80, 38.00],
+        [121.80, 38.30],
+        [121.50, 38.30],
+        [121.50, 38.00]
+      ],
+      "restrictions": {
+        "fishing_allowed": false,
+        "entry_allowed": true,
+        "max_speed_knots": 12
+      },
+      "time_rules": [
+        {
+          "type": "season",
+          "start_month": 5,
+          "start_day": 1,
+          "end_month": 9,
+          "end_day": 1,
+          "description": "每年5月1日至9月1日为禁渔期"
+        }
+      ]
+    },
+    {
+      "id": "military_zone_B",
+      "name": "军事禁区B",
+      "type": "restricted",
+      "boundary": [
+        [122.00, 38.50],
+        [122.20, 38.50],
+        [122.20, 38.70],
+        [122.00, 38.70],
+        [122.00, 38.50]
+      ],
+      "restrictions": {
+        "entry_allowed": false,
+        "max_speed_knots": null
+      },
+      "time_rules": []
+    },
+    {
+      "id": "speed_limit_zone_C",
+      "name": "港口限速区C",
+      "type": "speed_restricted",
+      "boundary": [
+        [121.70, 37.90],
+        [121.90, 37.90],
+        [121.90, 38.10],
+        [121.70, 38.10],
+        [121.70, 37.90]
+      ],
+      "restrictions": {
+        "entry_allowed": true,
+        "max_speed_knots": 8
+      },
+      "time_rules": []
+    }
+  ],
+  "ship_types": {
+    "拖网渔船": { "category": "fishing", "permit_required": true },
+    "围网渔船": { "category": "fishing", "permit_required": true },
+    "集装箱船": { "category": "cargo", "permit_required": false },
+    "散货船": { "category": "cargo", "permit_required": false },
+    "油轮": { "category": "tanker", "permit_required": false },
+    "客轮": { "category": "passenger", "permit_required": false },
+    "执法船": { "category": "government", "permit_required": false }
+  }
+}

@@ -1,0 +1,54 @@
+# ═══════════════════════════════════════════════════════════════
+# Docker 构建上下文排除
+# 注意：data/* 被整体排除，但下面显式白名单了种子文件
+# （Dockerfile 用 COPY data/geo 等把种子放进 /app/seed/data）。
+# ═══════════════════════════════════════════════════════════════
+
+# VCS / IDE / 缓存
+.git
+.claude
+.vscode
+.idea
+.ipynb_checkpoints
+.mypy_cache
+__pycache__
+*.pyc
+.cache
+*.log
+
+# 开发 / 实验目录（不进镜像）
+_diag
+experiments
+docs
+data/logs
+
+# 可写运行数据（进数据卷，不烘焙进镜像）
+data/input
+data/output
+data/cache
+data/logs
+data/memory
+data/avatars
+data/ais.db
+data/ais.db.bak
+
+# 旧模型 / 备份
+triage_model_bad*
+*.bak
+
+# 前端依赖与旧产物（dist 由构建阶段重新产出）
+frontend/frontend/node_modules
+frontend/frontend/dist
+
+# 构建自身
+.env
+.dockerignore
+Dockerfile
+docker-compose*.yml
+
+# 种子文件白名单（覆盖上面的 data/* 排除）
+!data/geo
+!data/geo/land_mask_002.json
+!data/llm_config.json
+!data/feedback_training_data.json
+!data/.last_retrain

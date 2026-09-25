@@ -1,0 +1,2 @@
+﻿mmsi,source_file,analysis_time,violation_detected,violation_type,violation_label,confidence,risk_level,routing,recommended_action,final_assessment,errors
+413773555,,2026-07-19 17:22:23,True,ais_off,故意关闭AIS信号试图逃避监控,95.00%,high,needs_review,auto_alert,尽管系统对数据质量的判断存在较大不确定性，但从轨迹中可以看出长时间无信号的情况，这与历史案例中的类似情况一致。因此可以确认为违规行为。,

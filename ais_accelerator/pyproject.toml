@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ais-accelerator"
+version = "0.1.0"
+description = "AIS 候选筛选和智能体输入加速管道"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ais_accelerator*"]

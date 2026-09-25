@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: ais-accelerator
+Version: 0.1.0
+Summary: AIS 候选筛选和智能体输入加速管道
+Requires-Python: >=3.10
+Requires-Dist: pydantic>=2.0.0

@@ -1,0 +1,2 @@
+﻿mmsi,name,ship_type,analysis_time,violation_detected,violation_type,violation_label,confidence,risk_level,recommended_action,final_assessment,evidence_summary,errors
+413773555,,,2026-07-19 16:12:46,False,,,0.6000,low,monitor,虽然AIS数据质量较差，并且存在位置和历史轨迹的不一致问题，但规则引擎和轨迹分析均未发现违规行为。综合考虑后认为风险较低。,[规则引擎专家] 船舶不在任何管制区域内 | [轨迹分析专家] 轨迹正常，未发现异常 | [AIS验证专家] 存在数据质量问题，MMSI '413773555' 的注册信息缺失且当前位置与历史轨迹不匹配或缺失,

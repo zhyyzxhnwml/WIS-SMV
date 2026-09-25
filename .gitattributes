@@ -1,0 +1,20 @@
+# 仓库内统一 LF。
+# 这个项目的运行环境是 Docker（Linux 容器），宿主机文件会被 COPY 进镜像：
+# 如果 shell 脚本带上 CRLF，容器里会报 `exec ./docker-entrypoint.sh: no such file
+# or directory`——因为 `\r` 被当成了 shebang 行的一部分。统一 LF 可以一劳永逸。
+* text=auto eol=lf
+
+# 二进制文件不做换行转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.xlsx binary
+*.zip binary
+*.gz binary
+*.db binary

@@ -1,0 +1,175 @@
+# ═══════════════════════════════════════════════════════════════
+# 智海巡航 — 完整部署（postgres + 向量库 + ollama + app）
+#   用法:  docker compose up -d --build      → http://localhost:5000
+#   向量库（etcd + minio + milvus）默认启用，什么都不能少。
+#   可选变量见 .env.example（端口冲突时改 APP_PORT / PG_HOST_PORT / OLLAMA_HOST_PORT / MILVUS_PORT）
+# ═══════════════════════════════════════════════════════════════
+name: zhihaixunhang
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: ais-postgres
+    environment:
+      # 与 app 容器保持一致：schema 里 analysis_time 默认值 to_char(now(),...) 也要用本地时区
+      TZ: ${TZ:-Asia/Shanghai}
+      POSTGRES_USER: ${PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-wmlwxhn520}
+      POSTGRES_DB: ${PG_DB:-postgres}
+    ports:
+      - "${PG_HOST_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-postgres} -d ${PG_DB:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ais-ollama
+    # 覆盖官方镜像 ENTRYPOINT（/bin/ollama）：
+    # 后台跑 serve，转发 TERM/INT，等服务就绪后拉取两个模型（幂等，重启秒过），再挂住 serve。
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      # $$ = 容器内 shell 变量（compose 不插值，原样透传给容器）
+      - >-
+        ollama serve &
+        SERVE_PID=$$!;
+        trap 'kill $$SERVE_PID; wait $$SERVE_PID 2>/dev/null' TERM INT;
+        i=0;
+        until ollama list >/dev/null 2>&1 || [ $$i -ge 60 ]; do sleep 1; i=$$((i+1)); done;
+        ollama pull "$$OLLAMA_MODEL" || true;
+        ollama pull "$$OLLAMA_EMBED_MODEL" || true;
+        wait $$SERVE_PID
+    environment:
+      OLLAMA_HOST: 0.0.0.0
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b-instruct-q4_K_M}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+    ports:
+      - "${OLLAMA_HOST_PORT:-11434}:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      # 两个模型都就绪才算 healthy（serve 启动早期 /api/tags 已可响应，但模型仍在拉取）
+      test: ["CMD-SHELL", "ollama list 2>/dev/null | grep -Fq \"$$OLLAMA_MODEL\" && ollama list 2>/dev/null | grep -Fq \"$$OLLAMA_EMBED_MODEL\""]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 30s
+    restart: unless-stopped
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.25
+    container_name: ais-milvus-etcd
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: 1000
+      ETCD_QUOTA_BACKEND_BYTES: 4294967296
+      ETCD_SNAPSHOT_COUNT: 50000
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    volumes:
+      - milvus_etcd:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: ais-milvus-minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: minio server /minio_data --console-address ":9001"
+    volumes:
+      - milvus_minio:/minio_data
+    healthcheck:
+      # minio 镜像内置 mc，用它做就绪检查（不依赖 curl）
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 20s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  milvus:
+    image: milvusdb/milvus:v3.0.0
+    container_name: ais-milvus
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    ports:
+      - "${MILVUS_PORT:-19530}:19530"
+    volumes:
+      - milvus_data:/var/lib/milvus
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 15s
+      timeout: 20s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+
+  app:
+    build: .
+    container_name: ais-app
+    # postgres 是唯一硬启动依赖（app 导入时建表）；ollama 只需 started（LLM 优雅降级，模型后台拉取）
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+      milvus:
+        condition: service_started
+    environment:
+      # 容器默认 UTC，会与本地（中国时区）时间差 8 小时，导致级联日志/检测时间全部晚 8 小时；
+      # tzdata 已在镜像内，设 TZ 即可让 datetime.now() / to_char(now()) 输出本地时间
+      TZ: ${TZ:-Asia/Shanghai}
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DB: ${PG_DB:-postgres}
+      PG_USER: ${PG_USER:-postgres}
+      PG_PASSWORD: ${PG_PASSWORD:-wmlwxhn520}
+      MILVUS_URI: http://milvus:19530
+      MILVUS_ENABLE: ${MILVUS_ENABLE:-on}   # 标准部署默认开启向量库
+      # 两套 Ollama 寻址：OLLAMA_BASE_URL → llm_config（ChatOllama/对话/探测）；
+      # OLLAMA_HOST → ollama-python 原始客户端（regulation_db 向量化等）
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b-instruct-q4_K_M}
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-prod}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+    ports:
+      - "${APP_PORT:-5000}:5000"
+    volumes:
+      - app_data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:5000/"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  pg_data:
+  ollama_models:
+  app_data:
+  milvus_etcd:
+  milvus_minio:
+  milvus_data:

@@ -1,0 +1,31 @@
+# ═══════════════════════════════════════════════════════════════
+# 本机（受限网络）专用 override —— 仅供当前这台机器本地运行/验证
+#   其它开发者不需要它：直接 `docker compose up -d --build` 即是完整栈。
+#   本机 Docker Hub / ollama.com 被屏蔽，拉不到 pg16 与 ollama 官方镜像：
+#     postgres: 用本机已缓存的 pg16（pg_data 卷即 pg16 初始化，镜像本地已有）
+#     ollama:   用 busybox 占位满足 depends_on（端口用 !reset 清空，宿主 Ollama 占 11434）；LLM 走宿主 Ollama
+#   Milvus 三件套镜像本机已缓存，随主 compose 正常启动。
+#   用法（本机需避开被占用的端口）:
+#     PG_HOST_PORT=55432 OLLAMA_HOST_PORT=11435 MILVUS_PORT=19531 \
+#       docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+# ═══════════════════════════════════════════════════════════════
+services:
+  postgres:
+    # 数据卷 pg_data 是 pg16 初始化的；pg16 镜像本地已缓存，切 pg17 会因版本不兼容崩循环
+    image: pgvector/pgvector:pg16
+  ollama:
+    image: busybox:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["sleep 999999"]
+    environment: {}
+    volumes: []
+    # compose 的 `ports: []` 不会清掉基础配置的映射，必须用 !reset；
+    # 否则 busybox 占位容器会尝试绑定 11434，与宿主原生 Ollama（已监听 11434）冲突
+    ports: !reset []
+    healthcheck:
+      test: ["CMD", "true"]
+  app:
+    environment:
+      # 用本机已装的宿主 Ollama（host.docker.internal = Docker Desktop 宿主机）
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      OLLAMA_HOST: http://host.docker.internal:11434
