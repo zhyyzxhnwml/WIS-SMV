@@ -85,21 +85,13 @@ def load_regdb():
     return None
 
 def format_ref(arts: list) -> str:
-    """法规条目列表 → 引用文本，形如「法规名 第36条《标题》（相关度73%）」。"""
-    refs = []
-    for a in arts:
-        ref = a.get("source", "")
-        num = a.get("article_number", "")
-        title = (a.get("title") or "").strip()
-        sim = a.get("similarity")
-        if num and num != "0":
-            ref += f" 第{num}条"
-        if title:
-            ref += f"《{title}》"
-        if sim is not None:
-            ref += f"（相关度{sim:.0%}）"
-        refs.append(ref)
-    return "；".join(refs[:3])
+    """法规条目列表 → 引用文本，形如「《法规名》第36条（正文首句…）相关度68%」。
+
+    格式统一交给 violation_catalog.format_article_ref（orchestrator 写入路径用的是
+    同一个函数），避免两条路径各写各的、界面文案漂移。
+    """
+    from ais_accelerator.violation_catalog import format_article_ref
+    return "；".join(format_article_ref(a) for a in arts[:3])
 
 
 def main() -> int:

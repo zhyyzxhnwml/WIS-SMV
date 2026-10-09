@@ -386,20 +386,11 @@ class EndToEndOrchestrator:
                 _arts = self.regulation_db.search_by_violation(_code, zone, top_k=3)
                 _best = _arts[0] if _arts else None
                 if _arts:
-                    _refs = []
-                    for _a in _arts:
-                        _name = _a.get("source", "")
-                        _num = _a.get("article_number", "")
-                        _title = (_a.get("title", "") or "").strip()
-                        _sim = _a.get("similarity")
-                        _ref = f"{_name}"
-                        if _num and _num != "0":
-                            _ref += f" 第{_num}条"
-                        if _title:
-                            _ref += f"《{_title}》"
-                        if _sim is not None:
-                            _ref += f"（相关度{_sim:.0%}）"
-                        _refs.append(_ref)
+                    # 引用文案统一由 violation_catalog.format_article_ref 生成
+                    # （backfill_violation_taxonomy 回填存量时用的是同一个函数，
+                    #  否则新写入与存量回填的文案会不一致）
+                    from ais_accelerator.violation_catalog import format_article_ref
+                    _refs = [format_article_ref(_a) for _a in _arts]
                     llm_result["regulation_ref"] = "；".join(_refs[:3])
                 else:
                     # 检索为空（含"相似度低于门槛被丢弃"）→ 目录兜底引用

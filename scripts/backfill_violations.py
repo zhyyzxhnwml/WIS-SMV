@@ -59,21 +59,8 @@ def main() -> int:
                 arts = []
         best = arts[0] if arts else None
         if arts:
-            refs = []
-            for a in arts:
-                name = a.get("source", "")
-                num = a.get("article_number", "")
-                title = (a.get("title") or "").strip()
-                sim = a.get("similarity")
-                ref = name
-                if num and num != "0":
-                    ref += f" 第{num}条"
-                if title:
-                    ref += f"《{title}》"
-                if sim is not None:
-                    ref += f"（相关度{sim:.0%}）"
-                refs.append(ref)
-            reg_ref = "；".join(refs[:3])
+            from ais_accelerator.violation_catalog import format_article_ref
+            reg_ref = "；".join(format_article_ref(a) for a in arts[:3])
             n_ref += 1
         else:
             reg_ref = FALLBACK_REG.get(code, FALLBACK_REG.get("unknown", ""))

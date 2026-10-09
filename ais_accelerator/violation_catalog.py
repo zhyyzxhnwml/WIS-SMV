@@ -31,6 +31,7 @@ ais_accelerator/violation_catalog.py — 违规类型规范化目录（二级分
 
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 # ── 一级类目 ───────────────────────────────────────────────────────
@@ -213,6 +214,61 @@ REG_ANCHORS: dict[str, list[tuple[str, str]]] = {
 
 
 # ── 法规兜底文本（检索失败时的保底引用） ─────────────────────────
+# ── 法规文档元数据：效力层级（优先级）／文件性质／适用地域 ──
+#
+# key = PDF 文件名去扩展名，**和 REG_ANCHORS 用同一套 key**（改了这里就得改锚定表）。
+#
+# priority：数字**小 = 效力高**，检索排序的主键（见 regulation_db.search_by_violation）。
+#   依据中国立法效力层级：法律 > 行政法规 > 国际规则 > 地方政府规章 > 规范性文件。
+#   为什么不按相似度排：实测 nomic 在短中文同域文本上的余弦**分不开相关与不相关**
+#   （相关对 0.583~0.845 与不相关对 0.727~0.772 完全重叠，详见 regulation_db.MIN_SIMILARITY
+#   上方注释）。既然分数不可靠，就用"效力层级"这个**确定的事实**当主排序，相似度只在
+#   同一层级内部决定先后。要调整口径，改这里的数字即可，不用动检索代码。
+#
+# doc_type 决定 rule/ 下的归放目录，region 供"地方法规优先本地"之类的展示/筛选用。
+DOC_META: dict[str, dict[str, Any]] = {
+    "中华人民共和国海上交通安全法2021": {
+        "doc_type": "法律", "priority": 1, "region": "全国",
+        "authority": "全国人民代表大会常务委员会",
+    },
+    "中华人民共和国渔港水域交通安全管理条例2019": {
+        "doc_type": "行政法规", "priority": 2, "region": "全国",
+        "authority": "国务院",
+    },
+    "COLREG": {
+        "doc_type": "国际规则", "priority": 3, "region": "国际",
+        "authority": "国际海事组织（IMO）",
+    },
+    "福州港港口章程": {
+        "doc_type": "地方政府规章", "priority": 4, "region": "福州",
+        "authority": "福州市人民政府",
+    },
+    "船舶防台风指南（试行）": {
+        "doc_type": "规范性文件", "priority": 5, "region": "全国",
+        "authority": "交通运输部海事局",
+    },
+    # regulations.json 里的 zones 解析出来的**示例**区域管制规定（军事禁区B/禁渔区A/
+    # 港口限速区C）。名字里就写着"样例数据"：不是真实法条，是配着区域功能用的占位条文。
+    # 排最后（与未登记同级），但**显式登记**——不登记的话每次导入都会告警，
+    # 告警就失去意义了（真正的新来源会被这条噪音盖住）。
+    "船舶违规检测规则库 - 样例数据": {
+        "doc_type": "样例数据", "priority": 9, "region": "示例",
+        "authority": "—",
+    },
+}
+
+# 认不出的来源（新放进来还没登记元数据的 PDF）：排在所有已登记之后，
+# 但仍然入库 —— 宁可排最后，也不要静默丢弃法规。
+DOC_META_FALLBACK: dict[str, Any] = {
+    "doc_type": "其他", "priority": 9, "region": "未知", "authority": "",
+}
+
+
+def doc_meta(source: str) -> dict[str, Any]:
+    """来源名 → {doc_type, priority, region, authority}；未登记返回 fallback。"""
+    return DOC_META.get((source or "").strip()) or dict(DOC_META_FALLBACK)
+
+
 FALLBACK_REG = {
     "ais_off": "《中华人民共和国海上交通安全法》关于船舶配备并正常使用自动识别系统（AIS）设备、保持航行信号连续的规定",
     "ais_gap": "《中华人民共和国海上交通安全法》关于船舶保持自动识别系统（AIS）连续正常发射的规定",
@@ -592,6 +648,49 @@ def list_catalog() -> dict[str, list[dict[str, Any]]]:
     }
 
 
+def law_display_name(source: str) -> str:
+    """法规 source → 展示用名称。
+
+    source 就是 PDF 文件名去扩展名（REG_ANCHORS 拿它当主键，**不能改动库里的值**），
+    所以尾上带着年份：「中华人民共和国海上交通安全法2021」。没有哪部法叫这个名字，
+    展示时去掉。
+
+    只在**末尾**且**前面不是「年」或括号**时才去 ——「1972年国际海上避碰规则」的
+    年份是名字本身的一部分（且在开头），不受影响。
+    """
+    s = (source or "").strip()
+    return re.sub(r"(?<![年（(])(?:19|20)\d{2}$", "", s) or s
+
+
+def format_article_ref(art: dict[str, Any], with_similarity: bool = True) -> str:
+    """法规条目 → 展示用引用文本。
+
+        《中华人民共和国海上交通安全法》第36条（船舶在航行中应当按照有关规定开启…）相关度68%
+
+    【为什么书名号只包法规名】
+      article["title"] 是解析时取的法条**正文首句**（见 RegulationParser.parse_pdf_text：
+      `re.split(r"[。；\\n]", content, maxsplit=1)[0]`），不是标题 —— 中文法条多数没有
+      条标题。把它塞进《》会读成"有这么一部法"，实测界面里就出现过
+      「《船舶在航行中应当按照有关规定开启船舶的自动识别、航行数据》」这种把半句正文
+      当法名的引用。所以标题放（）里。
+    """
+    src = law_display_name(art.get("source", ""))
+    num = str(art.get("article_number", "") or "")
+    title = (art.get("title") or "").strip()
+    sim = art.get("similarity")
+
+    ref = f"《{src}》" if src else ""
+    if num and num != "0":
+        # 小数编号（"4.1.1"，指南/标准体例）省掉"第/条" ——「第4.1.1条」不是中文
+        # 法规的引用写法；「第X条」体例才加。
+        ref += f"{num}" if "." in num else f"第{num}条"
+    if title:
+        ref += f"（{title[:40]}）"
+    if with_similarity and sim is not None:
+        ref += f"相关度{sim:.0%}"
+    return ref
+
+
 def build_violation_event(
     raw_type: Optional[str],
     final_assessment: str = "",
@@ -616,7 +715,7 @@ def build_violation_event(
 
     parts = [f"检测出{label}"]
     if best_article and best_article.get("source"):
-        src = best_article.get("source", "")
+        src = law_display_name(best_article.get("source", ""))
         num = best_article.get("article_number", "")
         title = (best_article.get("title") or "").strip()
         sim = best_article.get("similarity")
