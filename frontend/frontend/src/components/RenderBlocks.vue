@@ -59,6 +59,11 @@
 
 <script setup>
 import { ref, onMounted, onUpdated, nextTick, watch } from 'vue'
+// 必须按模块引入。这里原本写的是 `if (!window.echarts) return`，
+// 但全仓库（含 index.html）**从来没有任何地方给 window.echarts 赋值** ——
+// 别的图都走 `import * as echarts from 'echarts'`。于是这个守卫恒为真，
+// 渲染函数每次都在第一行返回：AI 对话里的图表块一直是空的，从未画出来过。
+import * as echarts from 'echarts'
 
 const props = defineProps({
   blocks: { type: Array, default: () => [] }
@@ -72,8 +77,6 @@ function chartHeight(block) {
 }
 
 function renderCharts() {
-  if (typeof window === 'undefined' || !window.echarts) return
-  const echarts = window.echarts
   props.blocks.forEach((block, i) => {
     if (block.kind !== 'chart') return
     const el = chartRefs.value[i]
@@ -99,11 +102,15 @@ function renderCharts() {
     } else {
       // bar / line
       const x = spec.x || []
+      // 后端 chart_block 一直在传 unit（"起" 等），但这个组件从来没读过 spec.unit，
+      // 等于单位算好了发过来又被丢掉，图上没有任何量纲。没有 y_name 时退用 unit。
+      // top 也要跟着让位：ECharts 把 yAxis.name 画在轴顶端，top:10 会把它裁掉。
+      const yName = spec.y_name || spec.unit || ''
       inst.setOption({
         tooltip: { trigger: 'axis' },
-        grid: { left: 40, right: 16, top: 10, bottom: 30 },
+        grid: { left: 40, right: 16, top: yName ? 26 : 10, bottom: 30 },
         xAxis: { type: 'category', data: x, axisLabel: { fontSize: 10, color: '#b9c6dd', rotate: x.length > 6 ? 30 : 0 }, axisLine: { lineStyle: { color: 'rgba(255,255,255,0.15)' } } },
-        yAxis: { type: 'value', name: spec.y_name || '', nameTextStyle: { fontSize: 10, color: '#b9c6dd' }, splitLine: { lineStyle: { type: 'dashed', color: 'rgba(255,255,255,0.08)' } }, axisLabel: { color: '#b9c6dd', fontSize: 10 } },
+        yAxis: { type: 'value', name: yName, nameGap: 12, nameTextStyle: { fontSize: 10, color: '#b9c6dd', align: 'left' }, splitLine: { lineStyle: { type: 'dashed', color: 'rgba(255,255,255,0.08)' } }, axisLabel: { color: '#b9c6dd', fontSize: 10 } },
         series: (spec.series || []).map((s, si) => ({
           name: s.name, type: spec.chart_type, smooth: spec.chart_type === 'line',
           data: s.data || [],

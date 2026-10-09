@@ -187,9 +187,12 @@ function buildCharts() {
   if (!l1Chart) l1Chart = echarts.init(l1ChartEl.value)
   l1Chart.setOption({
     tooltip: { trigger: 'axis' },
-    grid: { left: 130, right: 20, top: 10, bottom: 20 },
-    xAxis: { type: 'value', minInterval: 1 },
-    yAxis: { type: 'category', data: l1.map(t => t.label) },
+    // 横向条形图：数值轴是 x → 轴名给 x；y 是 L1 事件类型名，自带说明，不加轴名
+    grid: { left: 130, right: 24, top: 16, bottom: 48 },
+    xAxis: { type: 'value', minInterval: 1, name: '船舶数（艘）',
+      nameLocation: 'middle', nameGap: 28,
+      nameTextStyle: { fontSize: 11, color: '#5d7c92' }, axisLabel: { color: '#5d7c92' } },
+    yAxis: { type: 'category', data: l1.map(t => t.label), axisLabel: { color: '#5d7c92' } },
     series: [{ type: 'bar', data: l1.map(t => t.ships), itemStyle: { color: '#7c6ff0' } }],
   })
   const risk = summary.value.l3Risk || []
@@ -197,9 +200,12 @@ function buildCharts() {
   if (!riskChart) riskChart = echarts.init(riskChartEl.value)
   riskChart.setOption({
     tooltip: {},
-    grid: { left: 70, right: 20, top: 20, bottom: 30 },
-    xAxis: { type: 'category', data: risk.map(r => riskLabelMap[r.level] || r.level) },
-    yAxis: { type: 'value', name: '船舶数' },
+    grid: { left: 56, right: 20, top: 36, bottom: 58 },
+    xAxis: { type: 'category', data: risk.map(r => riskLabelMap[r.level] || r.level), name: '风险等级',
+      nameLocation: 'middle', nameGap: 30,
+      nameTextStyle: { fontSize: 11, color: '#5d7c92' }, axisLabel: { color: '#5d7c92' } },
+    yAxis: { type: 'value', name: '船舶数（艘）', nameGap: 14,
+      nameTextStyle: { fontSize: 11, color: '#5d7c92', align: 'left' }, axisLabel: { color: '#5d7c92' } },
     series: [{ type: 'bar', data: risk.map(r => r.ships),
       itemStyle: { color: p => ['#ea4335', '#ff9800', '#0f9d58'][p.dataIndex] || '#0c8ce9' } }],
   })

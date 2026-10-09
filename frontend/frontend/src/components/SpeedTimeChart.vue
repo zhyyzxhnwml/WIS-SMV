@@ -177,9 +177,16 @@ function buildOption() {
         return `${t}<br/>航速：${sp}`
       },
     },
-    grid: { left: 30, right: 16, top: 34, bottom: 56, containLabel: true },
+    // right 加宽给轴名让位；grid 的 bottom(56) 已够放"刻度 + 轴名"两行，
+    // 但不能再往下压 —— 底部 bottom:12 处有 dataZoom 滑块（高 18）
+    grid: { left: 30, right: 60, top: 34, bottom: 56, containLabel: true },
     xAxis: {
       type: 'time',
+      name: '时间',
+      // 轴名放轴末端（时间轴的常规位置）。不用 nameLocation:'middle'：
+      // 那需要再往下留约 47px，会撞上 dataZoom 滑块。
+      nameGap: 30,
+      nameTextStyle: { color: '#5d7c92', fontSize: 11 },
       axisLabel: { color: '#5d7c92', hideOverlap: true },
       axisLine: { lineStyle: { color: '#d6e7f2' } },
       splitLine: { show: false },

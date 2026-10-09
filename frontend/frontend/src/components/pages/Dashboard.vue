@@ -197,10 +197,20 @@ async function initCharts(trendData, distData) {
       tooltip: { show: true },
       formatter: name => name === '活跃船舶' ? '活跃（当日有≥1条有效AIS报文的船舶）' : name
     },
-    grid: { left: 50, right: 50, top: 10, bottom: 40 },
-    xAxis: { type: 'category', data: trendData.dates, axisLabel: { fontSize: 11, color: '#5d7c92' } },
+    // top 必须留出轴名的高度：ECharts 默认把 yAxis.name 画在轴的**顶端**，
+    // 原来是 top:10，名字被画到画布外，等于单位标签全程不显示（实测截图确认）。
+    // bottom 也要够：x 轴名 + 刻度标签 + 底部图例三层不能叠。
+    grid: { left: 56, right: 50, top: 36, bottom: 58 },
+    xAxis: {
+      type: 'category', data: trendData.dates,
+      name: '日期（月-日）', nameLocation: 'middle', nameGap: 30,
+      nameTextStyle: { fontSize: 11, color: '#5d7c92' },
+      axisLabel: { fontSize: 11, color: '#5d7c92' }
+    },
     yAxis: [
-      { type: 'value', name: '艘', nameTextStyle: { fontSize: 11 }, splitLine: { lineStyle: { type: 'dashed', color: '#d6e7f2' } }, axisLabel: { color: '#5d7c92' } },
+      { type: 'value', name: '船舶数（艘）', nameGap: 16,
+        nameTextStyle: { fontSize: 11, color: '#5d7c92', align: 'left' },
+        splitLine: { lineStyle: { type: 'dashed', color: '#d6e7f2' } }, axisLabel: { color: '#5d7c92' } },
     ],
     series: [
       { name: '活跃船舶', type: 'line', smooth: true, symbol: 'circle', symbolSize: 6,
@@ -323,9 +333,16 @@ async function initCharts(trendData, distData) {
   const speedBarColors = ['#0c8ce9', '#18b8a6', '#f5a524', '#ef5350']
   speedChart.setOption({
     tooltip: { trigger: 'axis', formatter: params => `${params[0].name}<br/>船舶数: ${params[0].value}艘` },
-    grid: { left: 40, right: 20, top: 10, bottom: 30 },
-    xAxis: { type: 'category', data: speedLabels, axisLabel: { fontSize: 11, color: '#5d7c92' } },
-    yAxis: { type: 'value', name: '船舶数', nameTextStyle: { fontSize: 11 }, splitLine: { lineStyle: { type: 'dashed', color: '#d6e7f2' } }, axisLabel: { color: '#5d7c92' } },
+    grid: { left: 56, right: 20, top: 36, bottom: 56 },
+    xAxis: {
+      type: 'category', data: speedLabels,
+      name: '航速区间', nameLocation: 'middle', nameGap: 28,
+      nameTextStyle: { fontSize: 11, color: '#5d7c92' },
+      axisLabel: { fontSize: 11, color: '#5d7c92' }
+    },
+    yAxis: { type: 'value', name: '船舶数（艘）', nameGap: 16,
+      nameTextStyle: { fontSize: 11, color: '#5d7c92', align: 'left' },
+      splitLine: { lineStyle: { type: 'dashed', color: '#d6e7f2' } }, axisLabel: { color: '#5d7c92' } },
     series: [{
       type: 'bar', barWidth: 30,
       itemStyle: {
@@ -345,15 +362,24 @@ async function initCharts(trendData, distData) {
   const trendCounts = distData.dailyTrend.map(d => d.count)
   trendChart.setOption({
     tooltip: { trigger: 'axis' },
-    grid: { left: 40, right: 20, top: 10, bottom: 30 },
-    xAxis: { type: 'category', data: trendDays, axisLabel: { fontSize: 11, color: '#5d7c92' } },
-    yAxis: { type: 'value', name: '起', nameTextStyle: { fontSize: 11 }, minInterval: 1, splitLine: { lineStyle: { type: 'dashed', color: '#d6e7f2' } }, axisLabel: { color: '#5d7c92' } },
+    // right 留宽：markLine 的均值标签贴在线的末端，原来 right:20 装不下
+    // 「均值 34」被画布右边缘裁掉，只剩一个「均」字（实测截图确认）
+    grid: { left: 56, right: 60, top: 36, bottom: 56 },
+    xAxis: {
+      type: 'category', data: trendDays,
+      name: '日期（月-日）', nameLocation: 'middle', nameGap: 28,
+      nameTextStyle: { fontSize: 11, color: '#5d7c92' },
+      axisLabel: { fontSize: 11, color: '#5d7c92' }
+    },
+    yAxis: { type: 'value', name: '违规事件数（起）', nameGap: 16, minInterval: 1,
+      nameTextStyle: { fontSize: 11, color: '#5d7c92', align: 'left' },
+      splitLine: { lineStyle: { type: 'dashed', color: '#d6e7f2' } }, axisLabel: { color: '#5d7c92' } },
     series: [{
       type: 'line', smooth: true, symbol: 'circle', symbolSize: 8,
       lineStyle: { color: '#ef5350', width: 2 },
       itemStyle: { color: '#ef5350' },
       areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: 'rgba(239,83,80,0.28)' }, { offset: 1, color: 'rgba(239,83,80,0.02)' }]) },
-      markLine: { data: [{ type: 'average', name: '平均值' }], label: { formatter: '均值 {c}' }, lineStyle: { color: '#f5a524', type: 'dashed' } },
+      markLine: { data: [{ type: 'average', name: '平均值' }], label: { formatter: '均值 {c}', position: 'insideEndTop' }, lineStyle: { color: '#f5a524', type: 'dashed' } },
       data: trendCounts,
     }]
   })

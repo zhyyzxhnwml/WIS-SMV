@@ -112,19 +112,30 @@ function buildCharts() {
   if (!issueChart) issueChart = echarts.init(issueChartEl.value)
   issueChart.setOption({
     tooltip: { trigger: 'axis' },
-    grid: { left: 100, right: 20, top: 10, bottom: 20 },
-    xAxis: { type: 'value', minInterval: 1 },
-    yAxis: { type: 'category', data: issues.map(i => i.label) },
-    series: [{ type: 'bar', data: issues.map(i => i.ship), itemStyle: { color: '#ff9800' } }],
+    // 横向条形图：数值轴是 x → 轴名给 x；y 是问题类型名，本身自带说明，不加轴名
+    // inverse: 接口按 ships 降序返回，横向条形图的类目默认自下而上，
+    // 不反转的话最大的那根会落在最底下，读起来是倒序
+    grid: { left: 100, right: 24, top: 16, bottom: 48 },
+    xAxis: { type: 'value', minInterval: 1, name: '船舶数（艘）',
+      nameLocation: 'middle', nameGap: 28,
+      nameTextStyle: { fontSize: 11, color: '#5d7c92' }, axisLabel: { color: '#5d7c92' } },
+    yAxis: { type: 'category', inverse: true, data: issues.map(i => i.label), axisLabel: { color: '#5d7c92' } },
+    // 字段是 ships 不是 ship —— 原来取 i.ship 恒为 undefined，
+    // 这张图画出来一根柱子都没有（同页右侧那张取 b.count 是对的，所以只有这张空）
+    series: [{ type: 'bar', data: issues.map(i => i.ships), itemStyle: { color: '#ff9800' } }],
   })
   // 剔除率分布 箱形图
   const bins = summary.value.removalRateBins || []
   if (!rateChart) rateChart = echarts.init(rateChartEl.value)
   rateChart.setOption({
     tooltip: {},
-    grid: { left: 60, right: 20, top: 20, bottom: 30 },
-    xAxis: { type: 'category', data: bins.map(b => b.label) },
-    yAxis: { type: 'value', name: '船舶数' },
+    // top 留 36 给 y 轴名：ECharts 把 yAxis.name 画在轴顶端，原来 top:20 会被裁掉
+    grid: { left: 56, right: 20, top: 36, bottom: 58 },
+    xAxis: { type: 'category', data: bins.map(b => b.label), name: '剔除率区间',
+      nameLocation: 'middle', nameGap: 30,
+      nameTextStyle: { fontSize: 11, color: '#5d7c92' }, axisLabel: { color: '#5d7c92' } },
+    yAxis: { type: 'value', name: '船舶数（艘）', nameGap: 14,
+      nameTextStyle: { fontSize: 11, color: '#5d7c92', align: 'left' }, axisLabel: { color: '#5d7c92' } },
     series: [{ type: 'bar', data: bins.map(b => b.count), itemStyle: { color: '#18b8a6' } }],
   })
 }

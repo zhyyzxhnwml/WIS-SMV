@@ -167,9 +167,13 @@ function buildCharts() {
   if (!compareChart) compareChart = echarts.init(compareChartEl.value)
   compareChart.setOption({
     tooltip: {},
-    grid: { left: 60, right: 20, top: 20, bottom: 30 },
-    xAxis: { type: 'category', data: ['原始点数均值', '保留点数均值'] },
-    yAxis: { type: 'value' },
+    // top 留 36 给 y 轴名（默认画在轴顶端，顶部不留位会被裁掉）；点数可达 4 位，left 给够
+    grid: { left: 64, right: 20, top: 36, bottom: 58 },
+    xAxis: { type: 'category', data: ['原始点数均值', '保留点数均值'], name: '统计口径',
+      nameLocation: 'middle', nameGap: 30,
+      nameTextStyle: { fontSize: 11, color: '#5d7c92' }, axisLabel: { color: '#5d7c92' } },
+    yAxis: { type: 'value', name: '轨迹点数（点）', nameGap: 14,
+      nameTextStyle: { fontSize: 11, color: '#5d7c92', align: 'left' }, axisLabel: { color: '#5d7c92' } },
     series: [{
       type: 'bar',
       data: [qlStats.value.avgOrig, qlStats.value.avgRet],
@@ -180,9 +184,12 @@ function buildCharts() {
   if (!qlChart) qlChart = echarts.init(qlChartEl.value)
   qlChart.setOption({
     tooltip: {},
-    grid: { left: 60, right: 20, top: 20, bottom: 30 },
-    xAxis: { type: 'category', data: ['良好(good)', '一般(fair)', '较差(poor)'] },
-    yAxis: { type: 'value', name: '船舶数' },
+    grid: { left: 56, right: 20, top: 36, bottom: 58 },
+    xAxis: { type: 'category', data: ['良好(good)', '一般(fair)', '较差(poor)'], name: '质量等级',
+      nameLocation: 'middle', nameGap: 30,
+      nameTextStyle: { fontSize: 11, color: '#5d7c92' }, axisLabel: { color: '#5d7c92' } },
+    yAxis: { type: 'value', name: '船舶数（艘）', nameGap: 14,
+      nameTextStyle: { fontSize: 11, color: '#5d7c92', align: 'left' }, axisLabel: { color: '#5d7c92' } },
     series: [{ type: 'bar', data: [ql.good, ql.fair, ql.poor], itemStyle: { color: '#0c8ce9' } }],
   })
 }
