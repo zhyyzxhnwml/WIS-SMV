@@ -30,7 +30,8 @@ import time  # 时间模块（用于性能计时）
 import urllib.request  # 轻量 HTTP 探测（不依赖 requests 库）
 from typing import Any, Optional  # 类型提示
 
-import llm_config  # 全局模型/参数配置（开发者模式，调用时读取）
+import llm_config  # 全局模型/参数配置（兼容层，开发者模式，调用时读取）
+import llm_providers  # 「级联判定」用途绑定的实际提供商（阶段 1）
 from .prompts import PROMPT_TEMPLATES  # 四级处理深度的Prompt模板字典
 
 try:
@@ -82,6 +83,10 @@ class LLMHandler:
         self._model_available = False  # 模型是否可用
         self._cfg_snapshot = None  # 配置快照（比对是否变化，变化则重建客户端）
         self._llm_lock = threading.Lock()  # 重建锁（防止并发重建竞态）
+        # 判定链路的提供商类型：ollama 走 langchain ChatOllama；其余走 llm_providers 出口
+        self._kind = "ollama"
+        self._api_key = ""
+        self._provider_name = ""
         self._init_llm()  # 尝试初始化 LLM
         self._cfg_snapshot = self._config_signature()  # 记录初始化时的配置快照
 
@@ -112,33 +117,58 @@ class LLMHandler:
             return False
 
     def _init_llm(self):
-        """尝试初始化 LLM 客户端（可重复调用，用于自动恢复 / 配置变更重建）。
+        """尝试初始化判定用的 LLM 客户端（可重复调用，用于自动恢复 / 配置变更重建）。
 
-        修复：先做一次 HTTP 连通性探测，Ollama 能响应了才构造客户端；
-        只有连通探测成功才标记模型可用，避免“构造成功=可用”的假阳性。
-        注意：本次探测失败（Ollama 仍在启动早期）仅返回而不把状态钉死成 False，
-        以便外层（analyze/_call_llm）下次调用时能再次尝试恢复。
+        Ollama：先做一次 HTTP 连通性探测，能响应了才构造客户端；只有连通探测成功
+        才标记模型可用，避免“构造成功=可用”的假阳性。本次探测失败（Ollama 仍在启动
+        早期）仅返回而不把状态钉死成 False，以便外层（analyze/_call_llm）下次调用时
+        能再次尝试恢复。
 
-        开发者模式：模型名/地址/参数从 llm_config 读取（调用时读取），
+        兼容网关/云端（阶段 1）：没有 /api/tags 这种免费探针，探活要花一次真实调用
+        （要花钱），所以不预探 —— 直接标记可用，把错误留给真实调用暴露。失败会经
+        _call_llm 的异常分支变成 risk_unverified，不会被伪装成「低风险正常」。
+
+        开发者模式：模型名/地址/参数从「级联判定」用途绑定读取（调用时读取），
         配置变更后由 _ensure_llm() 触发重建，无需重启。
         """
         if _LLM_DIAG:
             print(f"    [LLM-diag] _init_llm() HAS_OLLAMA={HAS_OLLAMA}", flush=True)
-        if not HAS_OLLAMA:
-            return
-        # 从全局配置读取（读不到回退实例属性），并缓存 num_predict/top_p/top_k
+        # 从「级联判定」绑定的提供商读取（读不到回退实例属性）
         try:
-            cfg = llm_config.get_config()
-            self.model_name = cfg.get("model", self.model_name)
-            self.base_url = cfg.get("base_url", self.base_url)
-            self.temperature = float(cfg.get("temperature", self.temperature))
-            self._num_predict = cfg.get("num_predict")
-            self._top_p = cfg.get("top_p")
-            self._top_k = cfg.get("top_k")
+            r = llm_providers.resolve("judge")
+            p = r.get("params") or {}
+            self.model_name = r.get("model") or self.model_name
+            self.base_url = r.get("base_url") or self.base_url
+            self.temperature = float(p.get("temperature", self.temperature))
+            self._num_predict = p.get("num_predict")
+            self._top_p = p.get("top_p")
+            self._top_k = p.get("top_k")
+            self._kind = r.get("kind") or "ollama"
+            self._api_key = r.get("api_key") or ""
+            self._provider_name = r.get("provider_name") or ""
         except Exception:
             self._num_predict = None
             self._top_p = None
             self._top_k = None
+            self._kind = "ollama"
+            self._api_key = ""
+
+        if self._kind != "ollama":
+            if not self._api_key:
+                self.llm = None
+                self._model_available = False
+                if _LLM_DIAG:
+                    print(f"    [LLM-diag] 判定提供商 {self._kind} 缺 API 密钥 → 不可用", flush=True)
+                return
+            self.llm = None  # 不走 langchain，_call_llm 里改走 llm_providers.complete
+            self._model_available = True
+            if _LLM_DIAG:
+                print(f"    [LLM-diag] _init_llm → kind={self._kind} provider={self._provider_name} "
+                      f"model={self.model_name}, model_available=True", flush=True)
+            return
+
+        if not HAS_OLLAMA:
+            return
         try:
             # 先探测服务是否真的能响应；Ollama 启动早期会 500/拒连 → 不判可用
             if not self._ollama_up():
@@ -170,16 +200,25 @@ class LLMHandler:
             if _LLM_DIAG:
                 print(f"    [LLM-diag] _init_llm → EXC {type(e).__name__}: {e}", flush=True)
 
+    def _ready(self) -> bool:
+        """判定链路是否就绪。Ollama 还要求客户端已构造；其它类型只看可用标记。"""
+        if self._kind != "ollama":
+            return bool(self._model_available)
+        return bool(self._model_available and self.llm is not None)
+
     def _config_signature(self) -> tuple:
-        """当前 llm_config 中影响客户端的字段签名（用于变更检测）。"""
-        cfg = llm_config.get_config()
+        """「级联判定」绑定的签名（影响客户端的字段；用于变更检测）。"""
+        r = llm_providers.resolve("judge")
+        p = r.get("params") or {}
         return (
-            cfg.get("base_url"),
-            cfg.get("model"),
-            cfg.get("temperature"),
-            cfg.get("num_predict"),
-            cfg.get("top_p"),
-            cfg.get("top_k"),
+            r.get("kind"),
+            r.get("base_url"),
+            r.get("model"),
+            p.get("temperature"),
+            p.get("num_predict"),
+            p.get("top_p"),
+            p.get("top_k"),
+            bool(r.get("api_key")),  # 只记「有没有密钥」，密钥本身不进签名
         )
 
     def _ensure_llm(self):
@@ -197,7 +236,7 @@ class LLMHandler:
     @property
     def model_available(self) -> bool:
         """LLM 模型是否可用。"""
-        return self._model_available and self.llm is not None
+        return self._ready()
 
     def analyze(
         self,
@@ -367,13 +406,13 @@ class LLMHandler:
         # 用带重试的初始化来覆盖启动窗口，避免启动期一次失败被永久钉死为不可用。
         max_retry = 5  # 最多重试次数
         for attempt in range(max_retry):
-            if self.llm is None or not self._model_available:
-                self._init_llm()  # 尝试重新连接 Ollama（内含 HTTP 探测）
-            if self.llm is not None and self._model_available:
+            if not self._ready():
+                self._init_llm()  # 尝试重新连接（Ollama 内含 HTTP 探测）
+            if self._ready():
                 break  # 已就绪，跳出
             if attempt < max_retry - 1:  # 非最后一次才等待（Ollama 秒级启动）
                 time.sleep(2)  # 起步稳定期稍短，后续增长
-        if self.llm is None or not self._model_available:
+        if not self._ready():
             return {  # LLM 不可用，返回安全默认值（mid+unverified，避免伪装成"低风险正常"）
                 "violation_detected": False,
                 "violation_type": None,
@@ -390,6 +429,12 @@ class LLMHandler:
             }
 
         try:
+            if self._kind != "ollama":
+                # 兼容网关/云端：走统一出口（_kind 已在 _init_llm 里连同密钥一起备好）
+                text, err = llm_providers.complete(prompt, purpose="judge", timeout=120)
+                if err:
+                    raise RuntimeError(err)
+                return self._parse_json(text)  # 解析并返回JSON结果
             from langchain_core.messages import HumanMessage  # 人类消息类
             response = self.llm.invoke([  # 调用LLM获取响应
                 HumanMessage(content=prompt)  # 以人类消息形式传入Prompt

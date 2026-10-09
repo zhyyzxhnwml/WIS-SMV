@@ -275,15 +275,17 @@ class ShipClaw:
         manual: str = "",
         manual_label: str = "",
     ) -> str:
-        """调用 Ollama 生成回复。"""
+        """调用模型生成回复。
+
+        传输统一走 llm_providers.complete()（「对话与智能体」绑定的提供商）——
+        本地 Ollama 与 OpenAI 兼容网关同一个出口，所以把 chat 绑到云端时这条链路也是通的。
+        prompt 组装保持原样，保证默认本地 Ollama 下发出的请求与改造前逐字相同。
+        """
         import llm_config
+        import llm_providers
 
         # 开发者模式：模型/地址/参数全部调用时读取，改完即时生效；读不到回退实例属性
         cfg = llm_config.get_config()
-        model_name = cfg.get("model") or self.model_name
-        ollama_url = cfg.get("base_url") or self.ollama_url
-        temperature = float(cfg.get("temperature", 0.7))
-        options = llm_config.get_ollama_options()
         cfg_system = (cfg.get("system_prompt") or "").strip()
 
         if not system_prompt:
@@ -304,27 +306,13 @@ class ShipClaw:
             system_prompt = f"{cfg_system}\n\n{system_prompt}"
 
         try:
-            import urllib.request
             full_prompt = f"{system_prompt}\n\n用户：{message}\n小慧："
-            payload = json.dumps({
-                "model": model_name,
-                "prompt": full_prompt,
-                "stream": False,
-                "temperature": temperature,
-                "options": options,
-            }).encode("utf-8")
-
-            req = urllib.request.Request(
-                f"{ollama_url}/api/generate",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            import urllib.request as _urllib
-            with _urllib.urlopen(req, timeout=60) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
-                return result.get("response", "").strip()
+            text, err = llm_providers.complete(full_prompt, purpose="chat", timeout=60)
+            if err:
+                return f"抱歉，我暂时无法连接到语言模型。请稍后再试。（错误：{err[:50]}）"
+            return text
         except Exception as e:
-            # Ollama 不可用时的降级回复
+            # 模型不可用时的降级回复
             return f"抱歉，我暂时无法连接到语言模型。请稍后再试。（错误：{str(e)[:50]}）"
 
     # ── 状态查询 ──

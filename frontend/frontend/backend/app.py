@@ -35,6 +35,8 @@ import sys
 import uuid
 import pg_db
 import llm_config
+import llm_providers
+import llm_presets   # 预设提供商目录（纯数据，见 llm_presets.py）
 # 阶段 0 公共地基：权限点 / 审计日志
 import audit
 import permissions
@@ -1654,39 +1656,34 @@ def ai_update_colors():
 # ── AI 对话核心 ──
 
 def _call_ollama(prompt: str, system: str = "") -> str:
-    """直接调用 Ollama API 生成回复（使用 urllib，避免依赖 requests 库）。
+    """发一次对话补全，返回文本（失败返回空串）。
 
-    模型名/地址/参数全部从 llm_config 读取（开发者模式全局生效）。
+    模型名/地址/参数从「对话与智能体」绑定的提供商读取（开发者模式即时生效）。
+    传输统一走 llm_providers.complete()：本地 Ollama 与 OpenAI 兼容网关同一个出口，
+    所以把 chat 绑到云端时这条兜底对话也是通的。
+
+    prompt 组装保持原样（全局 system_prompt 前置并入 prompt 文本）—— 这样默认
+    本地 Ollama 下发出的请求与改造前逐字相同，零配置回归才站得住。
     """
-    import urllib.request
-    import json as _json
-
     cfg = llm_config.get_config()
     cfg_system = (cfg.get("system_prompt") or "").strip()
     full_system = f"{cfg_system}\n\n{system}".strip() if cfg_system else system
     full_prompt = f"{full_system}\n\n{prompt}" if full_system else prompt
-    payload = _json.dumps({
-        "model": cfg["model"],
-        "prompt": full_prompt,
-        "stream": False,
-        "temperature": cfg["temperature"],
-        "options": llm_config.get_ollama_options(),
-    }).encode("utf-8")
 
     try:
-        req = urllib.request.Request(
-            f"{cfg['base_url']}/api/generate",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            result = _json.loads(resp.read().decode("utf-8"))
-            return result.get("response", "").strip()
+        text, err = llm_providers.complete(full_prompt, purpose="chat", timeout=60)
+        if err:
+            try:
+                logging.getLogger("app.ai").error("对话补全失败: %s", err)
+            except Exception:
+                pass
+            return ""
+        return text
     except Exception as e:
         # 安全地写日志，不用 print/sys.stderr（可能被 _OutputCapture 接管）
         try:
             _logger_err = logging.getLogger("app.ai")
-            _logger_err.error("Ollama 调用失败: %s", e)
+            _logger_err.error("模型调用失败: %s", e)
         except Exception:
             pass
     return ""
@@ -1959,6 +1956,162 @@ def dev_reset_llm_config():
     """恢复默认配置并落盘。"""
     cfg = llm_config.reset()
     return jsonify({"code": 200, "message": "已恢复默认配置", "data": cfg})
+
+
+# ── 开发者模式：模型提供商与用途绑定（阶段 1）──
+# 分工：读（列表/探测/测连通）对全部登录用户开放 —— 选模型是日常动作；
+# 写（增删改、改绑定）需要 model.config，因为这里会碰 API 密钥。
+# 密钥本身永不回传：列表只给 has_key / key_hint / key_from_env。
+
+def _provider_or_404(pid):
+    prov = llm_providers.get_provider(pid)
+    if prov is None:
+        return None, (jsonify({"code": 404, "message": "提供商不存在"}), 404)
+    return prov, None
+
+
+@app.route("/api/v1/dev/providers")
+@login_required
+def dev_list_providers():
+    """提供商列表（脱敏）+ 用途绑定 + 可选类型。"""
+    return ok({
+        "providers": llm_providers.list_providers(),
+        "bindings": llm_providers.get_bindings(),
+        "kinds": [{"value": k, "label": llm_providers.KIND_LABELS[k]}
+                  for k in llm_providers.KINDS],
+        "purposes": [{"value": p, "label": llm_providers.PURPOSE_LABELS[p]}
+                     for p in llm_providers.PURPOSES],
+    })
+
+
+@app.route("/api/v1/dev/provider-presets")
+@login_required
+def dev_provider_presets():
+    """预设提供商目录（只读）。
+
+    对全部登录用户开放：这里没有任何密钥，只是「DeepSeek 的地址长这样」这类公开信息。
+    真正加提供商仍要 model.config —— 因为那一步要填密钥。
+    """
+    return ok({"groups": llm_presets.list_groups()})
+
+
+@app.route("/api/v1/dev/providers", methods=["POST"])
+@perm_required("model.config")
+def dev_create_provider():
+    """新建提供商。载荷可以只给 {preset, api_key}，其余字段由预设补齐。"""
+    data, err_p = llm_presets.apply_preset(request.get_json() or {})
+    if err_p:
+        return jsonify({"code": 400, "message": err_p}), 400
+    ok_flag, err, view = llm_providers.upsert_provider(data)
+    if not ok_flag:
+        return jsonify({"code": 400, "message": err}), 400
+    audit.log("provider.create", target_type="provider", target_id=view["id"],
+              detail={"name": view["name"], "kind": view["kind"], "base_url": view["base_url"],
+                      "preset": (request.get_json() or {}).get("preset") or ""})
+    if data.get("api_key"):
+        # 只记「改了密钥」这件事，绝不记密钥本身
+        audit.log("provider.key_update", target_type="provider", target_id=view["id"],
+                  detail={"name": view["name"], "hint": view["key_hint"]})
+    msg = "提供商已创建"
+    if err:
+        return jsonify({"code": 200, "message": msg, "warning": err, "data": view})
+    return jsonify({"code": 200, "message": msg, "data": view})
+
+
+@app.route("/api/v1/dev/providers/<pid>", methods=["PUT"])
+@perm_required("model.config")
+def dev_update_provider(pid):
+    """修改提供商。api_key 字段缺席=保持原密钥，空串=清除，非空=覆盖。
+
+    也认 `preset`：缺席的字段用预设补（只补不覆盖）。用于「我建的时候没选预设，
+    现在想按某家的官方地址纠正一下」。
+    """
+    prov, resp = _provider_or_404(pid)
+    if resp:
+        return resp
+    data, err_p = llm_presets.apply_preset(request.get_json() or {})
+    if err_p:
+        return jsonify({"code": 400, "message": err_p}), 400
+    ok_flag, err, view = llm_providers.upsert_provider(data, pid=pid)
+    if not ok_flag:
+        return jsonify({"code": 400, "message": err}), 400
+    changed = sorted(k for k in data if k not in ("api_key",))
+    audit.log("provider.update", target_type="provider", target_id=pid,
+              detail={"name": view["name"], "fields": changed})
+    if data.get("api_key"):
+        audit.log("provider.key_update", target_type="provider", target_id=pid,
+                  detail={"name": view["name"], "hint": view["key_hint"]})
+    if err:
+        return jsonify({"code": 200, "message": "已保存", "warning": err, "data": view})
+    return jsonify({"code": 200, "message": "已保存", "data": view})
+
+
+@app.route("/api/v1/dev/providers/<pid>", methods=["DELETE"])
+@perm_required("model.config")
+def dev_delete_provider(pid):
+    """删除提供商。被用途绑定引用时拒绝 —— 否则那个用途会静默换成别的模型。"""
+    ok_flag, err = llm_providers.delete_provider(pid)
+    if not ok_flag:
+        return jsonify({"code": 400, "message": err}), 400
+    audit.log("provider.delete", target_type="provider", target_id=pid)
+    return jsonify({"code": 200, "message": "已删除"})
+
+
+@app.route("/api/v1/dev/providers/<pid>/models")
+@login_required
+def dev_provider_models(pid):
+    """探测某提供商的可用模型（按类型走 /api/tags 或 /v1/models）。"""
+    prov, resp = _provider_or_404(pid)
+    if resp:
+        return resp
+    _ok, data = llm_providers.list_models(pid)
+    return ok(data)
+
+
+@app.route("/api/v1/dev/providers/<pid>/test", methods=["POST"])
+@login_required
+def dev_test_provider(pid):
+    """用短 prompt 验证连通与模型可用。"""
+    prov, resp = _provider_or_404(pid)
+    if resp:
+        return resp
+    body = request.get_json() or {}
+    _ok_flag, data = llm_providers.test(pid, model=str(body.get("model") or ""))
+    if "error" in data:
+        return jsonify({"code": 502, "message": f"连接失败：{data['error']}",
+                        "error": data["error"]}), 502
+    return ok(data)
+
+
+@app.route("/api/v1/dev/bindings")
+@login_required
+def dev_get_bindings():
+    """用途绑定（含解析后实际生效的提供商与模型）。"""
+    return ok(llm_providers.get_bindings())
+
+
+@app.route("/api/v1/dev/bindings", methods=["PUT"])
+@perm_required("model.config")
+def dev_put_bindings():
+    """改用途绑定：{chat|judge|draft: {provider_id, model, params?} | null}。
+
+    传 null 表示取消显式绑定，回到「按能力自动回落」。
+    """
+    data = request.get_json() or {}
+    before = {k: v.get("provider_id") for k, v in llm_providers.get_bindings().items()}
+    ok_flag, err = llm_providers.set_bindings(data)
+    if not ok_flag:
+        return jsonify({"code": 400, "message": err}), 400
+    after = llm_providers.get_bindings()
+    changes = {k: {"from": before.get(k), "to": after[k]["provider_id"]}
+               for k in after if before.get(k) != after[k]["provider_id"]}
+    if changes:
+        audit.log("binding.update", target_type="binding",
+                  detail={"changes": changes,
+                          "models": {k: after[k]["model"] for k in changes}})
+    if err:
+        return jsonify({"code": 200, "message": "已保存", "warning": err, "data": after})
+    return jsonify({"code": 200, "message": "已保存", "data": after})
 
 
 # ── 开发者模式：自定义技能（用户提交 skill.md，智能体直接可用） ──

@@ -20,3 +20,4 @@ pdfminer.six==20251230
 langchain-core==1.4.9
 langchain-ollama==1.1.0
 requests==2.34.2
+cryptography==47.0.0
