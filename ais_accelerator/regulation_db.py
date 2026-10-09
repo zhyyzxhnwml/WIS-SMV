@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -66,21 +67,31 @@ EMBEDDING_DIM = 1024  # Milvus 集合向量维度（既有集合固定为 1024�
 # 法规检索相似度下限：低于它的结果**丢弃**，而不是当成"检索到了"写进 regulation_ref。
 # 这是工程下限、不是法规阈值。
 #
-# ⚠⚠ 关键实测结论（2026-09，语料 192 条 / COLREG + 海安法 + 渔港条例，见
-# _diag/check_regulation.py 第 [4] 节）：**这个分数分不开"相关"与"不相关"**。
+# ⚠⚠ 关键实测结论（2026-10-09，语料 283 条 / COLREG + 海安法 + 渔港条例 + 福州港 + 防台风指南，
+# 复现：data/logs/_run/similarity_recalib.py）：**这个分数分不开"相关"与"不相关"**。
 #
-#   相关对 top-1 余弦：0.583(对遇↔COLREG14) 0.630(交叉↔COLREG15) 0.642(渔港捕捞↔10)
-#                      0.762(禁航区↔海安法44) 0.845(超速↔海安法43)
+#   相关对 top-1 余弦：0.7652(对遇↔COLREG14，命中)   0.8270(交叉↔COLREG15，命中)
+#                      0.8133(渔港捕捞↔渔港条例10，命中)
+#                      0.7684(AIS中断↔海安法36，top 却是 COLREG37)
+#                      0.7512(禁航区↔海安法44，top 却是海安法57)
+#                      0.8511(超速↔海安法43，top 却是防台风指南6.1)
 #   不相关对 top-1 余弦：0.7265(船员薪酬) 0.7621(台风防台) 0.7717(货运单证)
 #
-# 两组**完全重叠**：不相关的货运单证(0.7717) 比相关的对遇(0.583)、交叉相遇(0.630)
-# 都高。所以任何单一阈值都不可能既留下"对遇"又滤掉"货运单证"——nomic 在短中文
-# 同域文本上的基线本身就高，余弦里那点语义差异被淹没。
+# 两组**重叠**（相关的最低 0.7512 < 不相关的最高 0.7717）：不相关的货运单证(0.7717)
+# 比相关的禁航区(0.7512)、AIS中断(0.7684) 都高。所以任何单一阈值都不可能既留下
+# "禁航区"又滤掉"货运单证"——nomic 在短中文同域文本上的基线本身就高。
+#
+# ⚠ 2026-10-09 取文改版（COLREG 去掉英文栏）后新出现的一个副作用，要记在这里：
+#   条目正文变短、变"纯中文"之后，在**纯向量**空间里反而更容易压过正确的海安法条目 ——
+#   上面三次"top 跑偏"全是这个原因（旧的 192 条语料里，"对遇"top-1 只有 0.583，
+#   现在同类查询普遍 0.75+）。短的中文条文对任何中文海事查询都有很高的基线相似度。
+#   生产路径不受影响（见下），但**不要**因为"分数变高了"就以为检索变好了。
 #
 # 结论：**不要把这个下限当相关性判据**。它的真实作用只有一个 —— 砍掉分布最尾部
 # 的噪声（自命中是 1.0000，尾部噪声实测 ≤0.5 区间），是个很弱的兜底。
 # 真正决定"检索到哪条法"的是另外两样东西：
-#   1. violation_catalog.REG_ANCHORS 锚定表（11/11 命中，人工确认过的条号）
+#   1. violation_catalog.REG_ANCHORS 锚定表（11/11 命中，人工确认过的条号；
+#      2026-10-09 复测：11/11 取到非空正文）
 #   2. search() 的 violation_code 字段过滤
 # 锚定命中时**直接返回、不受本下限约束**（所以第14条 0.583 照样能出来）。
 # MIN_SIMILARITY 只在两步都落空、退到纯向量检索时才生效。
@@ -91,28 +102,35 @@ MIN_SIMILARITY = 0.60
 # ARTICLE_PATTERN_ANCHORED 是**实际使用**的：条目开头必须在行首。
 # 为什么必须加这个约束：正文里到处是交叉引用（"应鸣放第三十四条3款规定的声号"
 # "依照第九条的规定"），不限位置切分会把它们也当成新条目的开头 —— 同一个条号被
-# 切出好几份。实测 COLREG 一本就切出 72 条（真值 38），其中 33 条是交叉引用碎片，
-# 13 个条号重复；海上交通安全法也多出 3 条。
+# 切出好几份。实测 COLREG 一本不限位置切出 73 条（真值 38），海上交通安全法也多出 3 条。
 #
 # 判定标准（可复现）：正确的解析应当让每个来源的条号构成**连续无缺口的 1..N**。
+# 加行首约束后，四个来源的条号全部连续无缺口。
+# 下表是当初定"行首约束"时的实测（原始取文、未容忍空白）；COLREG 那行的行首数
+# 后来因为下面的空白容忍从 37 变成 40（多出来的仍是交叉引用，由 dedupe 收掉）：
 #   来源        不限位置   行首
 #   COLREG        72      37（2..38，缺第1条见下）
 #   海安法        125     122（1..122）
 #   渔港条例       30      29（1..29）
 #   福州港章程     44      44（1..44）
-# 加上行首约束后，四个来源全部变成连续无缺口，且不再有重复条号。
 #
-# ⚠ COLREG 第1条 仍未入库：它落在封面/目录页，抽取出来标题不在行首。
-#   要收全这一本得按版式解析（双栏中英对照），见 dedupe_articles 的说明。
+# ⚠ COLREG 第1条 曾经整条收不到，而当时把原因判错了：不是"标题不在行首"（它就在行首），
+#   而是**这一条是散排的** —— 全书标题写作「第二条」「第三条」，唯独第1条写成
+#   「第 一 条」（第 / 一 / 条 之间有空格），旧模式匹配不上，于是静默跳过。
+#   现在允许空白，COLREG 条号成为连续的 1..38。
+#   （另一个**独立**缺陷是双栏中英对照的取文顺序，见 extract_pdf_text）
+# 第 / 数字 / 条 之间的空白必须容忍：这不是理论风险，是上面实测踩到的那一次。
+_SP = r"[ \t\xa0]*"
 ARTICLE_PATTERN_ANCHORED = re.compile(
-    r"(?:^|\n)[ \t]*第([一二三四五六七八九十百千零\d]+)条[ \t]*"
-    r"(.*?)(?=(?:^|\n)[ \t]*第[一二三四五六七八九十百千零\d]+条|$)",
+    rf"(?:^|\n)[ \t\xa0]*第{_SP}([一二三四五六七八九十百千零\d]+){_SP}条{_SP}"
+    rf"(.*?)(?=(?:^|\n)[ \t\xa0]*第{_SP}[一二三四五六七八九十百千零\d]+{_SP}条|$)",
     re.DOTALL,
 )
 
 # 兜底用：不限位置切分。仅当行首规则一条都切不出来时回退（见 parse_pdf_text）。
 ARTICLE_PATTERN = re.compile(
-    r"第([一二三四五六七八九十百千零\d]+)条\s*(.*?)(?=第[一二三四五六七八九十百千零\d]+条|$)",
+    rf"第{_SP}([一二三四五六七八九十百千零\d]+){_SP}条{_SP}"
+    rf"(.*?)(?=第{_SP}[一二三四五六七八九十百千零\d]+{_SP}条|$)",
     re.DOTALL,
 )
 
@@ -547,6 +565,169 @@ def report_duplicates(dups: dict[str, int]) -> None:
           + "，".join(f"{s} +{n}" for s, n in sorted(by_src.items(), key=lambda x: -x[1])))
 
 
+# ── PDF 取文（版面感知）──
+#
+# COLREG 是中英对照版式：同一页里一种语言在一栏、另一种在另一栏。PyMuPDF 的
+# page.get_text() 按**块序**拼接，不保证按栏读 —— 实测英文块会插进中文流里，
+# 两个后果都实测过：
+#   1. 条目正文里混进整段英文：改之前 COLREG 入库正文 100887 字；去掉英文栏后 25310 字；
+#      再去掉每页重复的出品方信息（见下"去页眉页脚"）才是条文本身的 21029 字。
+#      对中文查询，前两者的差额都只是噪声；
+#   2. 中英块交错会把条目边界挤漂：第23条实际是干净的，被夹碎的是第24条。
+# 对照页的处理：只保留含中日韩字的块，按「栏 → y」排序（报纸顺序）。
+#
+# 判定"这一页是不是对照页"用**纯拉丁散文的字数**，而不是"有没有英文"：
+# 数字表格、单位、型号（12.5 / N=34 / AIS）不是散文，不该让页面被当成对照页。
+#
+# 为什么是"字数"而不是"块数"：块数是个坏指标。第28页整栏英文是一个大块（块数=1），
+# 第1、2 页每栏各一个大块（块数=2）—— 用「块数 >= 3」判，正是这两类页漏判，
+# 而第1页漏判的后果是整段英文 Rule 1 留在「第1条」正文里（2720 字，其中过半是英文）。
+# 字数则把两类页分得很开，实测（rule/ 下五个 PDF 全部 113 页）：
+#   COLREG 对照页   散文 1168..2503 字，拉丁占比 0.65..0.88  → 38 页全部命中
+#   另外四个来源     散文 0 字（一页都没有；福州港有 5 页拉丁占比 0.32..0.74，
+#                   但那些是表格与英文名称，散文 0 字）      → 0 页误判
+# 阈值取 400：离误判上界（0）有量级余量，离命中下界（1168）留了余量，
+# 半页空白的对照页（正文没排满）也不至于漏判。
+#
+# 取文完整链路的最终实测（五个来源 113 页 → 283 条）：
+#   COLREG              38 条 1..38，正文 21029 字，不含英文与页眉页脚
+#   海上交通安全法2021     122 条 1..122，18040 字  ┐
+#   福州港港口章程          44 条 1..44，22429 字   ├ 与改动前一致，
+#   渔港水域条例2019        29 条 1..29，2432 字    │ 只有页码/出品方被去掉
+#   船舶防台风指南          47 条 小数编号，5223 字 ┘
+_CJK_RE = re.compile(r"[一-鿿]")
+_LATIN_PROSE_RE = re.compile(r"(?:\b[A-Za-z]{2,}\b[^A-Za-z]*){5,}")
+_BILINGUAL_MIN_PROSE_CHARS = 400
+_BILINGUAL_MIN_LATIN_SHARE = 0.25
+
+
+def _page_layout_stats(page) -> tuple[int, int, int]:
+    """(总字数, 纯拉丁块字数, 纯拉丁散文块字数) —— 判断这一页是不是对照页用。"""
+    total = latin = prose = 0
+    for b in page.get_text("blocks") or []:
+        txt = (b[4] or "").strip()
+        if not txt:
+            continue
+        total += len(txt)
+        if not _CJK_RE.search(txt):
+            latin += len(txt)
+            if _LATIN_PROSE_RE.search(txt):
+                prose += len(txt)
+    return total, latin, prose
+
+
+def _page_text(page) -> str:
+    """单页取文：对照页只留中文栏，其余页维持 page.get_text() 原样。"""
+    total, latin, prose = _page_layout_stats(page)
+    if not (total and prose >= _BILINGUAL_MIN_PROSE_CHARS
+            and latin / total >= _BILINGUAL_MIN_LATIN_SHARE):
+        return page.get_text() or ""
+
+    mid = page.rect.width / 2
+
+    def key(b):
+        x0, y0, x1 = b[0], b[1], b[2]
+        band = -1 if x0 < mid < x1 else (0 if x0 < mid else 1)
+        return (band, round(y0, 1), x0)
+
+    blocks = [b for b in (page.get_text("blocks") or [])
+              if (b[4] or "").strip() and _CJK_RE.search(b[4])]
+    return "".join(b[4] for b in sorted(blocks, key=key))
+
+
+def extract_pdf_text(pdf_path) -> str:
+    """从 PDF 提取文本（版面感知 + 去页眉页脚）。优先 PyMuPDF，回退到 pdfminer。
+
+    **唯一的取文入口**：RegulationDB._extract_pdf_text 与 seed 脚本都走这里。
+    两处各写一份的话迟早漂移成两种行为 —— 本文件里已经踩过这种坑。
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        fitz = None
+
+    if fitz is not None:
+        doc = fitz.open(str(pdf_path))
+        try:
+            pages = [_page_text(p) for p in doc]
+        finally:
+            doc.close()
+        return _strip_running_heads(pages)
+
+    try:
+        from pdfminer.high_level import extract_text
+        return extract_text(str(pdf_path))
+    except ImportError:
+        pass
+
+    print(f"  [WARN] {Path(pdf_path).name}: 无 PDF 解析库（需安装 PyMuPDF 或 pdfminer）")
+    return ""
+
+
+# ── 去页眉页脚（跨页重复行）──
+#
+# COLREG 每页都印着同一段出品方信息（"中国海员之家网站航海资料系列…"、书名、
+# 「第 / N / 页」、"…搜集整理出品，更多航海资料请到网站免费下载。"）。
+# 这段字在 38 条法规的正文里各出现一次 —— 对检索是**有害**噪声，不只是占字数：
+# 38 条正文共享同一段文字，余弦相似度会被这段共同文字拉平，条目之间反而分不开。
+#
+# 判据：一行（数字归一后）在**页边**出现在 80% 以上的页面上，就是页眉页脚。
+#   - 限定"页边"（每页前 8 行 / 后 8 行）：页眉页脚的定义就是在页边。
+#     不限定的话，正文里的项目符号（"（一）"）也会被误判成重复行删掉。
+#   - 要 80% 而不是 100%：偶有一页排版不同不该让整条规则失效（实测福州港 36/38）。
+#   - 数字归一（123 → #）：页码每页不同，不归一就认不出来。
+#   - 限长 160 字：重复的长段落是正文（例如各条共用的标准条款），不能当噪声删。
+#   - 少于 4 页的文档不做（样本太小，"3 页里 3 页都有"说明不了什么）。
+# 实测（rule/ 下五个 PDF 共 113 页）：
+#   COLREG        清掉 6 行 × 38 页（占正文 18%），那是唯一的重复块
+#   福州港港口章程   清掉每页一个孤立页码，正文少 ~110 字
+#   防台风指南       清掉 "— N —"（该来源本来就在 parse_numbered_text 里清过一次）
+#   海安法 / 渔港条例 无跨页重复行，一字不动
+_BOILERPLATE_EDGE_LINES = 8
+_BOILERPLATE_MIN_PAGES = 4
+_BOILERPLATE_PAGE_RATIO = 0.8
+_BOILERPLATE_MAX_LEN = 160
+_DIGITS_RE = re.compile(r"\d+")
+
+
+def _norm_line(line: str) -> str:
+    """归一化一行以便跨页比对：压空白、把数字统一成 #（页码每页都不同）。"""
+    return _DIGITS_RE.sub("#", " ".join(line.split()))
+
+
+def _strip_running_heads(pages: list[str]) -> str:
+    """去掉跨页重复的页眉页脚行。pages 是逐页取到的文本。"""
+    if len(pages) < _BOILERPLATE_MIN_PAGES:
+        return "".join(pages)
+
+    def edge_lines(text: str) -> list[str]:
+        lines = text.splitlines()
+        return lines[:_BOILERPLATE_EDGE_LINES] + lines[-_BOILERPLATE_EDGE_LINES:]
+
+    seen: dict[str, int] = {}
+    for text in pages:
+        for norm in {_norm_line(l) for l in edge_lines(text)
+                     if l.strip() and len(l.strip()) <= _BOILERPLATE_MAX_LEN}:
+            seen[norm] = seen.get(norm, 0) + 1
+
+    need = max(3, math.ceil(len(pages) * _BOILERPLATE_PAGE_RATIO))
+    boiler = {k for k, n in seen.items() if n >= need}
+    if not boiler:
+        return "".join(pages)
+
+    out = []
+    for text in pages:
+        lines = text.splitlines(keepends=True)
+        keep_n = len(lines) - _BOILERPLATE_EDGE_LINES
+        for i, line in enumerate(lines):
+            if (i < _BOILERPLATE_EDGE_LINES or i >= keep_n) \
+                    and line.strip() and len(line.strip()) <= _BOILERPLATE_MAX_LEN \
+                    and _norm_line(line) in boiler:
+                continue
+            out.append(line)
+    return "".join(out)
+
+
 # ── 向量化 ──
 
 def get_embedding(text: str, model: str = EMBEDDING_MODEL) -> list[float]:
@@ -813,27 +994,8 @@ class RegulationDB:
 
     @staticmethod
     def _extract_pdf_text(pdf_path: Path) -> str:
-        """从 PDF 文件提取文本。优先用 PyMuPDF，回退到 pdfminer。"""
-        try:
-            import fitz  # PyMuPDF
-            doc = fitz.open(str(pdf_path))
-            text = ""
-            for page in doc:
-                text += page.get_text()
-            doc.close()
-            return text
-        except ImportError:
-            pass
-
-        try:
-            from pdfminer.high_level import extract_text
-            return extract_text(str(pdf_path))
-        except ImportError:
-            pass
-
-        # 最后回退：用 ollama 的多模态能力（如果支持）
-        print(f"  [WARN] {pdf_path.name}: 无 PDF 解析库（需安装 PyMuPDF 或 pdfminer）")
-        return ""
+        """从 PDF 文件提取文本（实现见模块级 extract_pdf_text，取文只此一处）。"""
+        return extract_pdf_text(pdf_path)
 
     # ── Milvus 集合管理 ──
 

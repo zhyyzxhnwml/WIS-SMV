@@ -43,7 +43,7 @@ sys.path.insert(0, str(ROOT))
 from pymilvus import MilvusClient, DataType  # noqa: E402
 from ais_accelerator.regulation_db import (  # noqa: E402
     RegulationDB, RegulationParser, get_embedding,
-    apply_doc_meta, dedupe_articles, report_duplicates,
+    apply_doc_meta, dedupe_articles, report_duplicates, extract_pdf_text,
 )
 
 MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
@@ -100,14 +100,9 @@ def parse_all_articles() -> list:
     rule_dir = ROOT / "rule"
     if rule_dir.exists():
         for pdf in sorted(rule_dir.rglob("*.pdf")):
-            try:
-                import fitz  # PyMuPDF
-                doc = fitz.open(str(pdf))
-                text = "".join(p.get_text() or "" for p in doc)
-                doc.close()
-            except ImportError:
-                from pdfminer.high_level import extract_text
-                text = extract_text(str(pdf))
+            # 取文走 regulation_db.extract_pdf_text（版面感知），不在这里各写一份 ——
+            # 两处各写一份的话迟早漂移成两种行为（中英对照页的顺序问题就只在那边处理）
+            text = extract_pdf_text(pdf)
             if not text.strip():
                 print(f"  [SKIP] {pdf.name} 无文本")
                 continue
