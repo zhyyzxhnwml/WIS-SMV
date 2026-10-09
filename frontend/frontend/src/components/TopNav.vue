@@ -82,7 +82,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { aiConfig, isImageUrl } from '../store/ai.js'
-import { user, loadUser, resetUser, isAdmin, isSuper } from '../store/user.js'
+import { user, loadUser, resetUser, can } from '../store/user.js'
 import UserProfileModal from './UserProfileModal.vue'
 import AppIcon from './AppIcon.vue'
 
@@ -106,7 +106,11 @@ const navItems = computed(() => {
   return items
 })
 
-// 违规监管 + （管理员/超级管理员）系统管理 分组，按角色动态组装
+// 违规监管 + （有权限者）系统管理 分组，按权限点动态组装。
+// 权限点来自 /auth/status（后端 permissions.py 现算），前端只负责显隐 ——
+// 真正的门禁在路由上的 @role_required / @perm_required，这里隐藏只是不让用户
+// 点了才发现 403。系统总览等到对应阶段有页面了再加进来。
+// 注：「系统参数」曾在这里，已按需求移除（级联判定阈值不作为运行时旋钮暴露）。
 const navGroups = computed(() => {
   const groups = [
     {
@@ -116,14 +120,13 @@ const navGroups = computed(() => {
       ]
     }
   ]
-  if (isAdmin()) {
-    groups.push({
-      icon: 'settings', label: '系统管理',
-      children: [
-        ...(isSuper() ? [{ path: '/admin/users', icon: 'shield', label: '用户管理' }] : []),
-        { path: '/admin/orgs', icon: 'building', label: '组织管理' }
-      ]
-    })
+  const adminChildren = [
+    ...(can('user.manage') ? [{ path: '/admin/users', icon: 'shield', label: '用户管理' }] : []),
+    ...(can('org.manage') ? [{ path: '/admin/orgs', icon: 'building', label: '组织管理' }] : []),
+    ...(can('audit.view') ? [{ path: '/admin/audit', icon: 'file-text', label: '审计日志' }] : [])
+  ]
+  if (adminChildren.length) {
+    groups.push({ icon: 'settings', label: '系统管理', children: adminChildren })
   }
   return groups
 })

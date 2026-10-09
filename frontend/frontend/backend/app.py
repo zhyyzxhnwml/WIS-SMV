@@ -19,9 +19,10 @@ frontend/frontend/backend/app.py — Flask 后端 API
 
 from __future__ import annotations
 
-from flask import Flask, jsonify, request, send_from_directory, session
+from flask import Flask, jsonify, request, send_from_directory, session, Response
 from flask_cors import CORS
 import base64
+import csv
 import hashlib
 import io
 import json
@@ -34,6 +35,9 @@ import sys
 import uuid
 import pg_db
 import llm_config
+# 阶段 0 公共地基：权限点 / 审计日志
+import audit
+import permissions
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -246,6 +250,35 @@ def role_required(*roles):
     return deco
 
 
+def perm_required(key):
+    """按权限点限定访问（与 role_required 并存，不替换它）。
+
+    权限点 → 角色的映射在 permissions.py，三个内置角色固定。现有 9 处
+    @role_required 一行不改：它们的可达性与等价权限点一致，权限点只用来
+    表达**新增**的收紧（API 密钥、规则包发布）。
+
+    拒绝时写一条 denied 审计 —— 「谁试图做什么被挡了」是审计最该有的内容之一，
+    而它恰好是业务代码不会主动记录的部分。
+    """
+    def deco(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            u = current_user()
+            if not u:
+                return jsonify({"code": 401, "message": "未登录"}), 401
+            if not permissions.has(u.get("role"), key):
+                audit.log("auth.denied", target_type="permission", target_id=key,
+                          detail={"path": request.path, "method": request.method,
+                                  "role": u.get("role", "")},
+                          result=audit.RESULT_DENIED)
+                label = permissions.PERMISSION_LABELS.get(key, key)
+                return jsonify({"code": 403,
+                                "message": f"无权限：需要「{label}」"}), 403
+            return f(*args, **kwargs)
+        return decorated
+    return deco
+
+
 def _org_auth(conn, org_id):
     """组织管理授权：返回 (org_row, error) 或 (None, error_json)。
 
@@ -287,6 +320,9 @@ def auth_register():
     )
     conn.commit()
     conn.close()
+    # 注册是自助开门，必须留痕：谁开的门、从哪来
+    audit.log("auth.register", target_type="user", target_id=uid,
+              detail={"username": username})
     return ok({"id": uid, "username": username})
 
 
@@ -306,24 +342,47 @@ def auth_login():
     conn.close()
 
     if not user:
+        # 失败也要记：连续失败是入侵信号，且这是「未认证」记录 ——
+        # user_id 留空（身份未证实），被尝试的用户名放 detail。
+        audit.log("auth.login_failed", target_type="user",
+                  detail={"username": username},
+                  result=audit.RESULT_FAIL, user_id="", username="")
         return jsonify({"code": 401, "message": "用户名或密码错误"}), 401
 
     # 真实会话：用户身份写入签名 cookie，多用户并行登录互不串号
     session["uid"] = user["id"]
     session.permanent = True
 
+    audit.log("auth.login", target_type="user", target_id=user["id"],
+              detail={"role": user["role"]},
+              user_id=user["id"], username=user["username"])
     return ok(dict(user))
 
 
 @app.route("/api/v1/auth/logout", methods=["POST"])
 def auth_logout():
+    # 先取身份再清 session —— session.clear() 之后就查不到是谁了
+    u = current_user()
+    if u:
+        audit.log("auth.logout", target_type="user", target_id=u["id"],
+                  user_id=u["id"], username=u["username"])
     session.clear()
     return ok({"message": "已退出"})
 
 
 @app.route("/api/v1/auth/status")
 def auth_status():
-    return ok(current_user())
+    """当前登录用户。附带权限点清单 —— 前端菜单与按钮据此显隐。
+
+    未登录返回 data=null（保持原样，前端 Login.vue 依赖这个语义）。
+    权限点由 permissions.py 现算，不落库、不可篡改。
+    """
+    u = current_user()
+    if u:
+        u = dict(u)
+        u["role_label"] = permissions.role_label(u.get("role"))
+        u["perms"] = permissions.permissions_for(u.get("role"))
+    return ok(u)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2683,6 +2742,38 @@ ALTER TABLE detection_results ADD COLUMN IF NOT EXISTS violation_event TEXT DEFA
 ALTER TABLE detection_results ADD COLUMN IF NOT EXISTS violation_code TEXT DEFAULT '';
 ALTER TABLE detection_results ADD COLUMN IF NOT EXISTS violation_subtype TEXT DEFAULT '';
 ALTER TABLE detection_results ADD COLUMN IF NOT EXISTS violation_metric DOUBLE PRECISION DEFAULT 0;
+
+-- ═══ 阶段 0：权限点 / 系统参数 / 审计日志 ═══
+
+-- 三个内置角色。**只读表**：无 CRUD 路由、无管理页面，角色固定不增不减。
+-- permissions.py 的 ROLE_PERMISSIONS 是真值来源，本表是它的持久化镜像 —— 每次启动
+-- 同步一次。这样直接连库写 SQL 的人也能看懂「管理员」到底能做什么，不必去读 Python。
+CREATE TABLE IF NOT EXISTS roles (
+    name TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    builtin BOOLEAN DEFAULT TRUE,
+    permissions TEXT DEFAULT '[]',
+    description TEXT DEFAULT '',
+    updated_at TEXT DEFAULT (to_char(now(),'YYYY-MM-DD HH24:MI:SS'))
+);
+
+-- 审计日志。detail 存 JSON 文本（与 annotations / ml_probabilities 存法一致）。
+-- 时间列用文本 'YYYY-MM-DD HH24:MI:SS'，与本项目其它时间列同格式，便于字符串前缀比较。
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id SERIAL PRIMARY KEY,
+    ts TEXT DEFAULT (to_char(now(),'YYYY-MM-DD HH24:MI:SS')),
+    user_id TEXT DEFAULT '',
+    username TEXT DEFAULT '',
+    action TEXT NOT NULL,
+    target_type TEXT DEFAULT '',
+    target_id TEXT DEFAULT '',
+    detail TEXT DEFAULT '{}',
+    ip TEXT DEFAULT '',
+    result TEXT DEFAULT 'ok'
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(ts);
+CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action);
 """
 
 
@@ -2692,6 +2783,34 @@ def _init_db_tables():
     conn.executescript(DB_TABLES_SQL)
     conn.commit()
     conn.close()
+    _seed_roles()
+
+
+def _seed_roles():
+    """把三个内置角色同步进 roles 表（幂等，纯粹是权限点的持久化镜像）。
+
+    角色固定不增不减，所以这里是「同步」而不是「初始化」：每次启动按
+    permissions.py 覆盖写入，保证表里看到的永远是当前代码的真实权限集。
+    失败不阻断启动 —— roles 表只供人工查库与前端展示，不是鉴权依据
+    （鉴权走 permissions.has()，纯内存判断）。
+    """
+    try:
+        conn = get_db()
+        for role in permissions.ALL_ROLES:
+            conn.execute(
+                "INSERT INTO roles (name, label, builtin, permissions, description) "
+                "VALUES (?, ?, TRUE, ?, ?) "
+                "ON CONFLICT (name) DO UPDATE SET label = EXCLUDED.label, "
+                "permissions = EXCLUDED.permissions, description = EXCLUDED.description, "
+                "updated_at = to_char(now(),'YYYY-MM-DD HH24:MI:SS')",
+                (role, permissions.role_label(role),
+                 json.dumps(permissions.permissions_for(role), ensure_ascii=False),
+                 permissions.role_description(role)),
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[init] 角色播种失败（不影响启动）：{e}", file=sys.stderr)
 
 
 _init_db_tables()
@@ -2800,6 +2919,11 @@ def data_upload():
     total_violations = conn.execute(f"SELECT COUNT(*) as c FROM detection_results WHERE violation_detected = 1{(' AND ' + scope_sql) if scope_sql else ''}", scope_params).fetchone()["c"]
     total_points = conn.execute(f"SELECT COALESCE(SUM(track_points), 0) as c FROM detection_results{(' WHERE ' + scope_sql) if scope_sql else ''}", scope_params).fetchone()["c"]
     conn.close()
+
+    # 上传留痕：记文件名与解析出的规模，不记内容（可能很大且含业务数据）
+    audit.log("data.upload", target_type="file", target_id=source_file,
+              detail={"ships": total_ships, "violations": total_violations,
+                      "points": total_points, "bytes": len(content)})
 
     return ok({
         "totalRows": total_points,
@@ -3014,6 +3138,80 @@ def serve_avatar(filename):
 
 
 # ═══════════════════════════════════════════════════════════
+# 系统管理（阶段 0）：审计日志 / 角色说明
+#
+# 曾经这里还有一组「系统参数」接口（判定阈值可在线调整）。已按需求移除：
+# 级联判定阈值是流水线内部调定的量，不作为运行时旋钮对外暴露 —— 改错了会让
+# 判定质量静默下降，而「改动只影响之后的判定」这句话并不足以让它变成好主意。
+# 现在这些阈值重新是 ais_accelerator/config.py 与 triage_engine/router.py 里
+# 的硬编码常量，改动必须走代码评审。
+# ═══════════════════════════════════════════════════════════
+
+@app.route("/api/v1/admin/audit-logs", methods=["GET"])
+@perm_required("audit.view")
+def admin_audit_logs():
+    """审计日志查询。?format=csv 导出（带 BOM，Excel 打开中文不乱码）。
+
+    只读接口，不写审计 —— 否则翻一页日志就多一条日志。
+    """
+    kw = dict(
+        action=request.args.get("action", "").strip(),
+        username=request.args.get("username", "").strip(),
+        result=request.args.get("result", "").strip(),
+        date_from=request.args.get("date_from", "").strip(),
+        date_to=request.args.get("date_to", "").strip(),
+        page=request.args.get("page", 1, type=int),
+        page_size=request.args.get("page_size", 50, type=int),
+    )
+
+    if request.args.get("format") == "csv":
+        # 导出不受分页限制，但要有个上限，否则全表拉爆内存
+        kw["page"], kw["page_size"] = 1, 200
+        rows = audit.search(**kw)["items"]
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["时间", "用户", "动作", "对象类型", "对象", "结果", "IP", "详情"])
+        for r in rows:
+            w.writerow([r["ts"], r["username"] or r["user_id"], r["action_label"],
+                        r["target_type"], r["target_id"], r["result_label"], r["ip"],
+                        json.dumps(r["detail"], ensure_ascii=False)])
+        return Response("﻿" + buf.getvalue(), mimetype="text/csv; charset=utf-8",
+                        headers={"Content-Disposition":
+                                 "attachment; filename=audit_logs.csv"})
+
+    return ok(audit.search(**kw))
+
+
+@app.route("/api/v1/admin/audit-logs/actions")
+@perm_required("audit.view")
+def admin_audit_actions():
+    """库中实际出现过的动作（供筛选下拉），带中文标签与条数。"""
+    return ok(audit.distinct_actions())
+
+
+@app.route("/api/v1/admin/roles", methods=["GET"])
+@perm_required("user.manage")
+def admin_roles():
+    """三个内置角色的权限说明（只读）。给「用户管理」页的角色说明抽屉用。
+
+    直接由 permissions.py 现算，不查 roles 表 —— 表只是镜像，代码才是真值。
+    这样即使有人手工改了库，界面也不会显示错误的权限。
+    """
+    out = []
+    for role in permissions.ALL_ROLES:
+        out.append({
+            "name": role,
+            "label": permissions.role_label(role),
+            "description": permissions.role_description(role),
+            "permissions": [
+                {"key": k, "label": permissions.PERMISSION_LABELS.get(k, k)}
+                for k in permissions.permissions_for(role)
+            ],
+        })
+    return ok({"roles": out, "all_permissions": permissions.PERMISSIONS})
+
+
+# ═══════════════════════════════════════════════════════════
 # 超级管理员：用户管理
 # ═══════════════════════════════════════════════════════════
 
@@ -3086,6 +3284,11 @@ def admin_set_role(uid):
             )
     conn.commit()
     conn.close()
+    # 改角色是最需要留痕的操作之一：它直接改变一个人的权限边界，
+    # 而降级管理员还伴随组织交接，事后必须能回答「谁在何时把谁降了」
+    audit.log("user.update_role", target_type="user", target_id=uid,
+              detail={"username": target["username"], "from": old_role, "to": new_role},
+              user_id=me["id"], username=me["username"])
     return ok({"id": uid, "username": target["username"], "role": new_role})
 
 
@@ -3110,6 +3313,8 @@ def org_create():
     )
     conn.commit()
     conn.close()
+    audit.log("org.create", target_type="org", target_id=org_id,
+              detail={"name": name}, user_id=me["id"], username=me["username"])
     return ok({"id": org_id, "name": name, "admin_id": me["id"]})
 
 
@@ -3194,6 +3399,9 @@ def org_add_member(org_id):
     conn.execute("INSERT INTO org_members (org_id, user_id) VALUES (?, ?)", (org_id, member["id"]))
     conn.commit()
     conn.close()
+    audit.log("org.add_member", target_type="org", target_id=org_id,
+              detail={"org_name": org["name"], "username": username},
+              user_id=me["id"], username=me["username"])
     return ok({"message": "已加入", "user_id": member["id"]})
 
 
@@ -3209,6 +3417,10 @@ def org_remove_member(org_id, uid):
     conn.execute("DELETE FROM org_members WHERE org_id = ? AND user_id = ?", (org_id, uid))
     conn.commit()
     conn.close()
+    me = current_user()
+    audit.log("org.remove_member", target_type="org", target_id=org_id,
+              detail={"org_name": org["name"], "removed_user_id": uid},
+              user_id=me["id"], username=me["username"])
     return ok({"message": "已移除"})
 
 
@@ -3225,6 +3437,10 @@ def org_delete(org_id):
     conn.execute("DELETE FROM organizations WHERE id = ?", (org_id,))
     conn.commit()
     conn.close()
+    me = current_user()
+    audit.log("org.delete", target_type="org", target_id=org_id,
+              detail={"name": org["name"], "admin_id": org["admin_id"]},
+              user_id=me["id"], username=me["username"])
     return ok({"message": "组织已删除"})
 
 

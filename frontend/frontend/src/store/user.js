@@ -7,6 +7,8 @@ export const user = reactive({
   username: '',
   name: '',
   role: '',
+  roleLabel: '',   // 角色的展示名（「用户」→「普通用户」），由后端下发
+  perms: [],       // 权限点清单，由 /auth/status 下发（permissions.py 现算）
   avatar: '👤',
   createdAt: '',
   loaded: false
@@ -22,6 +24,8 @@ export async function loadUser() {
         username: st.username || '',
         name: st.name || st.username || '',
         role: st.role || '',
+        roleLabel: st.role_label || st.role || '',
+        perms: Array.isArray(st.perms) ? st.perms : [],
         avatar: st.avatar || '👤',
         createdAt: st.created_at || '',
         loaded: true
@@ -39,6 +43,8 @@ export function resetUser() {
   user.username = ''
   user.name = ''
   user.role = ''
+  user.roleLabel = ''
+  user.perms = []
   user.avatar = '👤'
   user.createdAt = ''
   user.loaded = true
@@ -49,3 +55,7 @@ export const isAdmin = () => ['超级管理员', '管理员'].includes(user.role
 
 // 超级管理员专属
 export const isSuper = () => user.role === '超级管理员'
+
+// 权限点判断。清单由后端下发，前端只做显隐 —— **真正的门禁在后端**
+// （@perm_required），这里隐藏菜单只是不让用户点了才发现 403。
+export const can = (key) => user.perms.includes(key)

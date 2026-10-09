@@ -32,6 +32,7 @@ const routes = [
   { path: '/dev', name: 'dev', component: () => import('./components/pages/DevMode.vue'), meta: { title: '开发者模式' } },
   { path: '/admin/users', name: 'admin-users', component: () => import('./components/pages/UserManage.vue'), meta: { title: '用户管理' } },
   { path: '/admin/orgs', name: 'admin-orgs', component: () => import('./components/pages/OrgManage.vue'), meta: { title: '组织管理' } },
+  { path: '/admin/audit', name: 'admin-audit', component: () => import('./components/pages/AuditLogs.vue'), meta: { title: '审计日志' } },
 
   // 兜底：任何没匹配上的地址都回数据分析，而不是渲染出一片空白
   { path: '/:pathMatch(.*)*', redirect: '/dashboard' }
