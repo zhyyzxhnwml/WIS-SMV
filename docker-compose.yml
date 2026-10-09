@@ -154,6 +154,18 @@ services:
       SECRET_KEY: ${SECRET_KEY:-change-me-in-prod}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+      # ── 容器内 HTTP 代理绕行 ──
+      # Docker Desktop 若在 Settings → Resources → Proxies 里配了代理，它会把
+      # http_proxy/https_proxy/NO_PROXY 注入到**此后新建**的容器（已有容器重启不刷新）。
+      # 默认的 NO_PROXY 只有 127.0.0.1,localhost,host.docker.internal —— 不含 compose 服务名，
+      # 于是 app 访问 http://ollama:11434 会被发去容器内的 127.0.0.1:12000（那儿没人监听），
+      # 报 urllib error [Errno 111] Connection refused，表现为「Ollama 已 healthy 但 LLM 不可用」，
+      # 且 regulation_db 的向量化也会静默降级。
+      # 这里显式覆盖 NO_PROXY（容器内显式 env 优先于 Docker Desktop 注入）：
+      # 内网服务名一律不走代理，出网（阶段 1 的云厂商 API）仍走代理。
+      # 注意：requests/urllib 的 no_proxy **不支持 CIDR**，所以服务名必须逐个列出（CIDR 是给 curl/pip 兜底的）。
+      NO_PROXY: localhost,127.0.0.1,host.docker.internal,app,ollama,milvus,etcd,minio,postgres,172.16.0.0/12,10.0.0.0/8
+      no_proxy: localhost,127.0.0.1,host.docker.internal,app,ollama,milvus,etcd,minio,postgres,172.16.0.0/12,10.0.0.0/8
     ports:
       - "${APP_PORT:-5000}:5000"
     volumes:
