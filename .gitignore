@@ -11,7 +11,19 @@ __pycache__/
 # data/ 是 Docker 卷 app_data:/app/data 在宿主机上的落点：
 # 含上传的 AIS 原始数据、缓存、日志、头像等，1.3G 且随时在变，不入库。
 # 注意：experiments/ 下的数据集（含 16M 的铜锣峡原始 CSV）是输入数据，仍然入库。
-data/
+#
+# ⚠ 这里写 `data/*` 而不是 `data/`，是为了下面能白名单几个**构建期必需**的种子文件。
+#   git 不允许对「父目录已被排除」的文件做反向包含（!data/xxx.json 不生效），
+#   所以父目录只能排除到一层，再逐个放行。
+#   不放行的话，全新 clone 到服务器后 `docker compose build` 会直接失败 ——
+#   Dockerfile 里有 COPY data/geo / data/llm_config.json 等 4 行，源文件不存在即报错。
+#   本地一直能构建是因为这些文件在磁盘上（未跟踪但存在），掩盖了这个问题。
+#   data/public（2.6G）与 data/cache（2.7G）仍被 `data/*` 排除，不会被误入库。
+data/*
+!data/geo
+!data/llm_config.json
+!data/feedback_training_data.json
+!data/.last_retrain
 
 # ── 运行期缓存 ──
 .cache/
