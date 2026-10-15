@@ -620,13 +620,15 @@ def incremental_update():
 
 - [x] quality.py 打标记模式（`QualityReport`：`good/fair/poor`，`QualityIssue.code` 10 种）✅
 - [x] segment.py 轨迹分段标记（`segments` 边界索引）✅
-- [x] detect.py 候选事件检测（`CandidateType` 7 类：restricted_area_entry / speed_violation / low_speed_fishing / ais_gap / course_anomaly / position_jump / collision_risk）✅
+- [x] detect.py 候选事件检测（`CandidateType` 15 类：区域内 restricted_area_entry / illegal_fishing / anchoring_out_of_bounds；质量 ais_gap / ais_off / position_jump；操纵 course_anomaly；场驱动 speed_violation / low_speed_fishing / wrong_way_navigation；航道驱动 fairway_anchoring；多船 collision_risk / overtaking_violation / give_way_failure / illegal_towing）✅
 - [x] merge.py 事件合并 ✅
 - [x] compress.py RDP 事件感知压缩（500点→~10点，`compress_for_event`）✅
 - [x] rules.py 规则预筛（`JsonRuleProvider` 射线法 + `RagRuleProvider` + `season_is_active`）✅
 - [x] annotator.py 组装完整数据 + annotations + **28 维特征** ✅
 - [x] water.py WaterChecker 陆地规避（LandMask 栅格 + 数据驱动航道走廊）✅
 - [x] collision.py 碰撞风险评估（CIR / DCPA / TCPA）✅
+- [x] colreg.py / towing.py 多船归责检测（让路船是否实际避让 → `give_way_failure`；长时间极小间距同速同行 → `illegal_towing`），判据与 `encounter.py` 共用同一套接近过程索引 ✅
+- [x] violation_catalog.py 违规分类目录（16 个规范码 / 8 个一级类目 / 三级细类定档，全站分类与法规引用的唯一真源）✅
 
 ### Phase 2：数据库搭建（✅ 已完成）
 
@@ -685,7 +687,7 @@ def incremental_update():
 |---|---|
 | `ais_accelerator/` | 加速器核心模块 ✅ |
 | `ais_accelerator/annotator.py` | 轨迹标注 + 28 维特征提取（`FEATURE_NAMES`） |
-| `ais_accelerator/models.py` | Pydantic 模型（`AnnotatedTrack` / `CandidateType` 7 类） |
+| `ais_accelerator/models.py` | Pydantic 模型（`AnnotatedTrack` / `CandidateType` 15 类） |
 | `ais_accelerator/pipeline.py` | 管线主流程（ingest→quality→segment→detect→碰撞→merge→compress→build） |
 | `ais_accelerator/facade.py` | 外观模式统一接口（`AISAccelerationFacade`） |
 | `experiments/run.py` | 架构对比实验入口（速度/实用性/容错） |

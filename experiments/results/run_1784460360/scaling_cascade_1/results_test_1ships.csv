@@ -1,2 +1,0 @@
-﻿mmsi,source_file,analysis_time,violation_detected,violation_type,violation_label,confidence,risk_level,routing,recommended_action,final_assessment,errors
-413773555,,2026-07-19 20:10:04,True,ais_off,故意关闭AIS信号试图逃避监控,90.00%,high,obvious_issue,auto_alert,轨迹数据中存在长时间的AIS信号中断，符合故意关闭AIS信号的违规行为。,

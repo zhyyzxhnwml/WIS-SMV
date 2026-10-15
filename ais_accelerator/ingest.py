@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS ais_points (
     speed REAL NOT NULL,
     course REAL NOT NULL,
     status TEXT,
+    vessel_type TEXT,
     quality_flags TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS metadata (
@@ -45,10 +46,17 @@ CREATE TABLE IF NOT EXISTS metadata (
 );
 """
 
+# 缓存格式版本。**改了表结构或解析口径就要 +1**：
+# 指纹里带上它，旧缓存会自动失效重建。不加的话，旧 sqlite 没有 vessel_type 列，
+# 新代码 SELECT 它会抛 "no such column"，而更糟的情况是加列成功但全为 NULL ——
+# 船型静默丢失，禁渔判定悄悄退回速度判据，结果看起来正常却已经不对了。
+SCHEMA_VERSION = 2
+
 
 def source_fingerprint(source: Path) -> str:  # 生成源文件的指纹（用于缓存判断）
     stat = source.stat()  # 获取文件状态信息
-    payload = f"{source.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8")  # 文件路径+大小+修改时间
+    payload = (f"v{SCHEMA_VERSION}|{source.resolve()}|{stat.st_size}"
+               f"|{stat.st_mtime_ns}").encode("utf-8")  # 版本+文件路径+大小+修改时间
     return hashlib.sha256(payload).hexdigest()[:16]  # 返回SHA256前16位作为指纹
 
 
@@ -113,6 +121,7 @@ class SQLiteAISStore:  # SQLite AIS数据存储器
                             point.speed,  # 航速
                             point.course,  # 航向
                             point.status,  # 船舶状态
+                            point.vessel_type,  # 船型码（禁渔判定用）
                             json.dumps(point.quality_flags, ensure_ascii=False),  # 质量标记JSON
                         )
                     )
@@ -162,7 +171,8 @@ class SQLiteAISStore:  # SQLite AIS数据存储器
             for (mmsi,) in mmsi_rows:  # 遍历每个MMSI
                 rows = connection.execute(  # 查询该船的所有AIS点
                     """
-                    SELECT timestamp, lat, lon, speed, course, status, quality_flags
+                    SELECT timestamp, lat, lon, speed, course, status, vessel_type,
+                           quality_flags
                     FROM ais_points WHERE mmsi = ? ORDER BY timestamp
                     """,
                     (mmsi,),  # 参数化查询
@@ -176,11 +186,17 @@ class SQLiteAISStore:  # SQLite AIS数据存储器
                         speed=row[3],  # 航速
                         course=row[4],  # 航向
                         status=row[5],  # 船舶状态
-                        quality_flags=json.loads(row[6] or "[]"),  # 质量标记
+                        vessel_type=row[6],  # 船型码
+                        quality_flags=json.loads(row[7] or "[]"),  # 质量标记
                     )
                     for row in rows  # 遍历数据库行
                 ]
-                yield ShipProfile(mmsi=mmsi), points  # 生成船舶概要+轨迹点
+                # 船型是船级属性、逐点重复，取第一个非空值即可。
+                # 顺带把 ShipProfile.ship_type 填上 —— 这个字段此前一直是 None
+                # （构造时只传了 mmsi），规则匹配拿不到船型。
+                vessel_type = next(
+                    (p.vessel_type for p in points if p.vessel_type), None)
+                yield ShipProfile(mmsi=mmsi, ship_type=vessel_type), points
         finally:
             connection.close()  # 确保关闭数据库连接
 
@@ -189,8 +205,8 @@ class SQLiteAISStore:  # SQLite AIS数据存储器
         connection.executemany(  # 执行批量插入
             """
             INSERT INTO ais_points
-            (mmsi, timestamp, lat, lon, speed, course, status, quality_flags)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (mmsi, timestamp, lat, lon, speed, course, status, vessel_type, quality_flags)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             batch,  # 数据批次
         )

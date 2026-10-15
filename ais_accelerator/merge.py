@@ -27,15 +27,41 @@ from .models import CandidateEvent, CandidateType  # 候选事件和事件类型
 COMPATIBLE_TYPES = {  # 可合并的事件类型对
     frozenset({CandidateType.LOW_SPEED_FISHING, CandidateType.COURSE_ANOMALY}),  # 低速捕捞 + 航向异常
     frozenset({CandidateType.AIS_GAP, CandidateType.POSITION_JUMP}),  # AIS中断 + 位置跳变
+    # AIS_OFF（报文在但内容不可用）与 POSITION_JUMP 同源于"这一串报文本身就是坏的"，
+    # 与上面 AIS_GAP + POSITION_JUMP 是同一类配对。
+    # **不把 AIS_GAP 与 AIS_OFF 配成一对**：两者判据互斥（没收到报文 / 收到了但没用），
+    # 真要合并就等于把两种不同的法定义务钉成一个码。
+    frozenset({CandidateType.AIS_OFF, CandidateType.POSITION_JUMP}),  # 导航要素不可用 + 位置跳变
 }
 
+# 这些类型的 features 里带 target_mmsi（对方船），是核心证据，
+# 因此**不同目标船**的事件不能合并（见 _can_merge 的护栏）。
+PAIRWISE_TYPES = {  # 船-船事件类型
+    CandidateType.COLLISION_RISK,  # 碰撞风险
+    CandidateType.OVERTAKING_VIOLATION,  # 违规追越
+    CandidateType.GIVE_WAY_FAILURE,  # 让路船未让路（同一条船可同时对多条船负让路义务）
+    CandidateType.ILLEGAL_TOWING,  # 违规拖带/并靠（拖带对象必须是同一条船）
+}
+
+# 数值只表达合并时的取舍，与 violation_catalog.CODE_SEVERITY 是两把尺（后者定展示
+# 主类型）。但相对次序照着后者排，免得同一对事件在"展示"和"合并"两处选出不同的主类型。
+# 缺项不会崩（_merge_pair 用 .get 兜底为 0），只会让新类型在合并时永远输——所以每个码都要在。
 TYPE_PRIORITY = {  # 事件类型优先级（数值越高优先级越高）
-    CandidateType.RESTRICTED_AREA_ENTRY: 6,  # 禁航区进入（最高）
-    CandidateType.SPEED_VIOLATION: 5,  # 超速
-    CandidateType.LOW_SPEED_FISHING: 4,  # 低速捕捞
-    CandidateType.AIS_GAP: 3,  # AIS中断
-    CandidateType.POSITION_JUMP: 2,  # 位置跳变
-    CandidateType.COURSE_ANOMALY: 1,  # 航向异常（最低）
+    CandidateType.RESTRICTED_AREA_ENTRY: 10,  # 禁航区进入（最高）
+    CandidateType.ANCHORING_OUT_OF_BOUNDS: 9,  # 越界锚泊
+    CandidateType.FAIRWAY_ANCHORING: 9,  # 航道内锚泊（同为"停在了不该停的水域"）
+    CandidateType.COLLISION_RISK: 8,  # 碰撞风险
+    CandidateType.OVERTAKING_VIOLATION: 7,  # 违规追越
+    CandidateType.WRONG_WAY_NAVIGATION: 7,  # 逆向航行
+    CandidateType.GIVE_WAY_FAILURE: 7,  # 让路船未让路（同上两者同级的规则违反）
+    CandidateType.ILLEGAL_FISHING: 6,  # 违规捕捞（法定违规）
+    CandidateType.SPEED_VIOLATION: 6,  # 超速
+    CandidateType.ILLEGAL_TOWING: 6,  # 违规拖带/并靠
+    CandidateType.LOW_SPEED_FISHING: 5,  # 低速捕捞嫌疑
+    CandidateType.AIS_OFF: 4,  # 导航要素不可用
+    CandidateType.AIS_GAP: 4,  # AIS中断
+    CandidateType.POSITION_JUMP: 3,  # 位置跳变
+    CandidateType.COURSE_ANOMALY: 2,  # 航向异常（最低）
 }
 
 
@@ -54,6 +80,11 @@ def _can_merge(  # 判断两个事件是否可以合并（时空临近性）
         return False  # 不能合并
     if first.zone_id != second.zone_id:  # 不同区域
         return False  # 不能合并
+    if first.candidate_type in PAIRWISE_TYPES:  # 船-船事件
+        # 一艘船可以同时追越/危险接近**多条**船，target_mmsi 是判断"对谁"的唯一依据。
+        # 合并会把两条不同目标的记录压成一条，另一条的证据与相对方位就丢了。
+        if first.features.get("target_mmsi") != second.features.get("target_mmsi"):  # 目标船不同
+            return False  # 不能合并
     gap = (second.start_time - first.end_time).total_seconds() / 60  # 时间间隔（分钟）
     if gap > config.merge_gap_minutes:  # 超过时间合并阈值
         return False  # 不能合并
@@ -70,7 +101,9 @@ def _can_merge(  # 判断两个事件是否可以合并（时空临近性）
 def _merge_pair(first: CandidateEvent, second: CandidateEvent) -> CandidateEvent:  # 合并两个事件为一个
     primary = max(  # 取优先级最高的事件类型作为主类型
         (first.candidate_type, second.candidate_type),  # 两个事件类型
-        key=lambda value: TYPE_PRIORITY[value],  # 按优先级排序
+        # 用 .get 兜底：以后再加枚举类型时，忘了登记 TYPE_PRIORITY 只会退化为
+        # "优先级 0"，而不是在合并阶段抛 KeyError 把整条船的管线打断。
+        key=lambda value: TYPE_PRIORITY.get(value, 0),  # 按优先级排序
     )
     related = {  # 收集所有相关类型
         *first.related_types,  # 第一个事件的相关类型

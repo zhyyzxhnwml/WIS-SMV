@@ -40,8 +40,8 @@
       </div>
       <div class="card">
         <div class="card-header">
-          <h3>违规类型分布</h3>
-          <span class="card-subtitle">各类违规行为统计</span>
+          <h3>违规类目分布</h3>
+          <span class="card-subtitle">按一级类目统计，点击类目下钻到具体违规类型</span>
         </div>
         <div class="card-body">
           <div ref="chartViolationType" class="chart-container"></div>
@@ -231,7 +231,15 @@ async function initCharts(trendData, distData) {
 
   // 2. 违规类目分布（环形图，点击类目下钻到二级类型）
   violationChart = echarts.init(chartViolationType.value)
-  const catColors = ['#ef5350', '#0c8ce9', '#f5a524', '#18b8a6', '#7c6ff0', '#ff8f5c', '#9e9e9e']
+  // 类目配色。本轮类目从 7 个加到 8 个（新增「锚泊管理」），所以补齐到 8 色，
+  // 并把灰色留给末位 —— 色彩按**全量类目表**的位置取，不按筛后的下标取：
+  // 类目视图只画 ship_count>0 的扇区，按筛后下标取色会让某个空类目一出现，
+  // 后面的扇区整体串色（「其他」拿到红色，与 AIS设备类同色）。
+  const catColors = ['#ef5350', '#0c8ce9', '#f5a524', '#18b8a6', '#7c6ff0', '#ff8f5c', '#5c9e3d', '#9e9e9e']
+  const catColorOf = (name) => {
+    const i = (catalogData?.categories || []).findIndex(c => c.name === name)
+    return catColors[(i < 0 ? 0 : i) % catColors.length]
+  }
   let currentCatDrill = null   // 当前下钻类目名，null=类目视图
   let catalogData = null       // 缓存 catalog 数据
 
@@ -242,8 +250,8 @@ async function initCharts(trendData, distData) {
       currentCatDrill = null
       const data = catalogData.categories
         .filter(c => c.ship_count > 0)
-        .map((c, i) => ({ value: c.ship_count, name: c.label, _name: c.name,
-                           itemStyle: { color: catColors[i % catColors.length] } }))
+        .map(c => ({ value: c.ship_count, name: c.label, _name: c.name,
+                     itemStyle: { color: catColorOf(c.name) } }))
       violationChart.setOption({
         title: { text: '违规类目分布', subtext: '点击类目下钻', left: 'center', top: 0,
                  textStyle: { fontSize: 13, color: '#0d2b42' }, subtextStyle: { fontSize: 10, color: '#9e9e9e' } },

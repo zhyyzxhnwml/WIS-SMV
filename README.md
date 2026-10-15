@@ -212,7 +212,7 @@ E:\AIS\
 │   └── claw_memory.py      #   养成记忆（持久化用户偏好）
 │
 ├── frontend/frontend/      # 🌐 Web 前端 + 后端
-│   ├── src/                #   Vue 3 源码（Dashboard / ShipMonitor / ViolationManagement…）
+│   ├── src/                #   Vue 3 源码（Dashboard / ShipMonitor / ReportDocuments…）
 │   └── backend/app.py      #   Flask 后端 API（/api/v1 约 62 个端点）
 │
 ├── database/schema.sql     # 🗄️ PostgreSQL + pgvector 建表 SQL（核心案例库）
@@ -241,7 +241,7 @@ E:\AIS\
 | 级联 | `/api/v1/cascade/*` | 检测统计 / 级联日志 / 准确率 |
 | 数据 | `/api/v1/data/*` | CSV 上传 / 检测结果 / 用户统计 |
 | 区域 | `/api/v1/zone/analyze` | 区域行为分析 |
-| 开发者 | `/api/v1/dev/*` | LLM 配置 / 模型列表 / 自定义技能 CRUD |
+| 开发者 | `/api/v1/dev/*` | 模型提供商 / 用途绑定 / 可执行插件 |
 | 用户 | `/api/v1/user/*` | 个人资料 / 密码 / 头像 |
 | 管理 | `/api/v1/admin/*` | 用户列表 / 角色分配（仅超级管理员） |
 | 组织 | `/api/v1/orgs/*` | 组织 CRUD / 成员管理 |

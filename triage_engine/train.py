@@ -29,10 +29,17 @@ from __future__ import annotations
 import argparse  # 命令行参数解析模块
 import json  # JSON 序列化模块
 import os  # 操作系统接口
+import sys  # 系统接口（标准输出编码）
 from pathlib import Path  # 跨平台路径操作
 from typing import Optional  # 类型注解
 
 import numpy as np  # 数值计算库
+
+# 中文 Windows 控制台默认 GBK，输出里的 ✓ █ 等字符不在 GBK 码表内，
+# 会以 UnicodeEncodeError 崩在**保存模型之后**——模型是好的，脚本却非零退出，
+# 调用方（CI / 批处理）据此判定训练失败。与本仓其他入口脚本同一处理。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from .model import TriageModel, LABELS  # 导入模型类和四分类标签
 from .pgvector_client import PGVectorClient  # 导入 PostgreSQL 数据库客户端
@@ -79,30 +86,46 @@ def build_synthetic_dataset(
     X = []  # 初始化特征列表
     y = []  # 初始化标签列表
 
+    # 碰撞风险 6 维尾段（FEATURE_NAMES 第 22–27 维）：
+    #   [collision_risk_count, max_cri, min_dcpa_nm, min_tcpa_minutes,
+    #    avg_relative_speed, nearby_ship_count]
+    # 编码约定（见 annotator._extract_features）：**无碰撞事件时六维全为 0**，
+    # 其中 min_dcpa_nm=0 是"缺席"哨兵而非"危险"——真实 DCPA 是 0.1~2.0 的小正数。
+    # 显式写出来：原先四个模板都以 [0.0]*42 结尾，乘性噪声下 0 仍是 0，
+    # 于是这六列在训练集里恒等于 0，模型永远学不到碰撞风险。
+    _NO_COLLISION = [0.0] * 6  # 无碰撞态势
+    _TAIL_RESERVED = [0.0] * 36  # 第 28–63 维仍是预留
+
+    def _tail(collision: list[float]) -> list[float]:
+        return collision + _TAIL_RESERVED
+
     # 特征模板定义
     _base_normal = np.array([  # 正常类别特征模板
         50, 2, 0, 0, 2, 0.95, 0.98, 0.90,  # 轨迹点数/标记数/严重标记/警告标记/信息标记/平均置信度/最高置信度/最低置信度
         60, 0.5, 8.0, 10.2, 6.5,  # 时长/速度方差/平均速度/最高速度/最低速度
         1, 0, 0, 0, 0, 0, 2, 0, 0,  # 航向变化/AIS中断/位置跳变/规则命中/事件/重叠标记/分段/质量问题/重复点
-    ] + [0.0] * 42, dtype=np.float32)  # 预留的 42 维扩展特征（全 0）
+    ] + _tail(_NO_COLLISION), dtype=np.float32)
 
     _base_obvious = np.array([  # 明显违规类别特征模板
         200, 8, 2, 4, 2, 0.92, 0.98, 0.70,  # 高点数量/多标记/严重标记多/警告标记多/信息标记/置信度中等
         120, 15.0, 12.0, 22.0, 2.0,  # 长时长/高速度方差/中等速度/高最高速/低最低速
         3, 1, 0, 3, 2, 1, 3, 0, 0,  # 多次航向变化/AIS中断/无位置跳变/多规则命中/多事件/有重叠/多分段
-    ] + [0.0] * 42, dtype=np.float32)
+    ] + _tail([3.0, 0.85, 0.15, 4.0, 12.0, 3.0]),  # 多起碰撞风险/CRI 高/DCPA 很近/TCPA 很近/相对速度大/多艘邻近
+        dtype=np.float32)
 
     _base_risk = np.array([  # 存在风险类别特征模板
         100, 5, 0, 2, 3, 0.80, 0.92, 0.65,  # 中等数量/有警告标记/信息标记多/置信度中等偏低
         90, 5.0, 10.0, 16.0, 4.0,  # 中等时长/中等速度方差/中等平均速度/中等最高速/较低最低速
         2, 0, 1, 1, 1, 0, 2, 1, 2,  # 有过航向变化/无AIS中断/有位置跳变/有规则命中/有事件
-    ] + [0.0] * 42, dtype=np.float32)
+    ] + _tail([1.0, 0.45, 0.9, 12.0, 5.0, 1.0]),  # 一起碰撞风险/CRI 中/尚有余量
+        dtype=np.float32)
 
     _base_review = np.array([  # 需要审查类别特征模板
         80, 4, 0, 1, 3, 0.55, 0.70, 0.30,  # 中等数量/低置信度/置信度范围大（不确定性高）
         75, 3.0, 7.0, 12.0, 3.0,  # 中等时长/较低速度方差/较低平均速度/较低最高速
         1, 0, 0, 0, 1, 0, 2, 1, 1,  # 少有航向变化/无AIS中断/无位置跳变/无规则命中/有事件
-    ] + [0.0] * 42, dtype=np.float32)
+    ] + _tail([2.0, 0.60, 0.45, 8.0, 8.0, 2.0]),  # 证据互相矛盾：CRI 不低却仍有可观 DCPA
+        dtype=np.float32)
 
     bases = [_base_normal, _base_obvious, _base_risk, _base_review]  # 四类特征模板列表
 
@@ -116,7 +139,8 @@ def build_synthetic_dataset(
         sample = np.maximum(sample, 0)  # 截断负值为 0
 
         # 对整型特征取整
-        int_indices = [0, 1, 2, 3, 4, 13, 14, 15, 16, 17, 18, 19, 20, 21]  # 整型特征的索引列表
+        # 整型特征：计数类。22(collision_risk_count) 与 27(nearby_ship_count) 也是计数
+        int_indices = [0, 1, 2, 3, 4, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 27]
         sample[int_indices] = np.maximum(0, np.round(sample[int_indices]))  # 取整并确保非负
 
         X.append(sample)  # 添加到特征列表
@@ -181,30 +205,22 @@ def train_initial(
         print(f"  {label}: {count} 条 ({count/len(y_train)*100:.0f}%)")
 
     # 特征名
-    feature_names = [  # 定义 64 个特征的实际含义名称
-        "original_point_count",  # f0: 原始轨迹点数
-        "annotation_count",  # f1: 标记总数
-        "critical_annotation_count",  # f2: 严重标记数
-        "warning_annotation_count",  # f3: 警告标记数
-        "info_annotation_count",  # f4: 信息标记数
-        "avg_annotation_confidence",  # f5: 标记平均置信度
-        "max_annotation_confidence",  # f6: 标记最高置信度
-        "min_annotation_confidence",  # f7: 标记最低置信度
-        "total_duration_minutes",  # f8: 总时长（分钟）
-        "speed_variance",  # f9: 速度方差
-        "avg_speed",  # f10: 平均速度
-        "max_speed",  # f11: 最高速度
-        "min_speed",  # f12: 最低速度
-        "course_change_count",  # f13: 航向变化次数
-        "ais_gap_count",  # f14: AIS 信号中断次数
-        "position_jump_count",  # f15: 位置跳变次数
-        "rule_hit_count",  # f16: 规则命中次数
-        "event_count",  # f17: 事件数量
-        "overlap_annotation_count",  # f18: 重叠标记数
-        "segment_count",  # f19: 分段数量
-        "quality_issue_count",  # f20: 质量问题数
-        "duplicate_point_count",  # f21: 重复点数
-    ] + [f"reserved_{i}" for i in range(42)]  # f22-f63: 42 维预留扩展特征
+    # 这里此前是**手抄**的 22 个名字 + 42 个 reserved_*，而
+    # ais_accelerator/annotator.py 的 FEATURE_NAMES 已经长到 28 维——第 22–27 维
+    # 是 6 个碰撞风险特征（collision_risk_count / max_cri / min_dcpa_nm /
+    # min_tcpa_minutes / avg_relative_speed / nearby_ship_count）。
+    # 手抄的后果：特征向量里第 22–27 列**装的确实是碰撞数据**，名字却叫
+    # reserved_22..27，而训练模板那 42 维恒为 0——于是 LightGBM 学到的
+    # feature_infos 里这 6 列全是 none，模型对碰撞态势完全盲。
+    # 直接引用源头，避免再次脱节。
+    from ais_accelerator.annotator import FEATURE_NAMES  # noqa: E402
+
+    _N_NAMED = len(FEATURE_NAMES)  # 有语义的特征维数（当前 28）
+    if _N_NAMED > 64:
+        raise ValueError(f"FEATURE_NAMES 已扩到 {_N_NAMED} 维，超过模型容量的 64")
+    feature_names = list(FEATURE_NAMES) + [
+        f"reserved_{i}" for i in range(64 - _N_NAMED)
+    ]  # 其余为预留扩展特征
 
     result = model.train(  # 训练模型
         X_train, y_train,  # 训练特征和标签

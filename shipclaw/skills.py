@@ -675,12 +675,16 @@ class ViolationEvidenceSkill:
         if qr.get("level"):
             parts.append(f"  · AIS 数据质量：{qr['level']}")
         if anns:
+            # 白名单取自 violation_catalog.CANONICAL（全部规范违规码）+ rule_hit，
+            # 而不是在这里手写类型元组：手写的那版不会崩，但每加一个新违规码
+            # 就得记得回来补一笔，忘了这个码的中文标签就被静默过滤掉、
+            # 在"L1 打标"一行里看不见。CANONICAL 加码时这里自动跟上。
+            from ais_accelerator.violation_catalog import CANONICAL  # 全部规范违规码
+
+            violation_types = set(CANONICAL) | {"rule_hit"}  # 事件类 + 规则命中类标注
             v_labels = sorted({
                 a.get("label") for a in anns
-                if (a.get("label") or "") and a.get("type") in (
-                    "speed_violation", "low_speed_fishing", "restricted_area_entry",
-                    "ais_gap", "position_jump", "course_anomaly", "rule_hit",
-                )
+                if (a.get("label") or "") and a.get("type") in violation_types
             })
             if v_labels:
                 parts.append(f"  · L1 打标：{'、'.join(v_labels[:8])}")
@@ -790,142 +794,67 @@ class UserOverviewSkill:
             return f"查询数据概况时出错：{e}"
 
 
-# ── 9. 用户自定义技能（开发者提交 skill.md） ──
 
-CUSTOM_SKILL_TEMPLATE = """---
-name: my_skill
-label: 我的技能
-icon: 🧩
-description: 用一句话说明这个技能能做什么（会显示给用户）
-min_level: 1
-trigger_keywords: 关键词1, 关键词2, 关键词3
----
+# ═══════════════════════════════════════════════════════════
+# 可执行插件（阶段 2）—— 判定链上跑过的插件，在对话里也能被用上
+# ═══════════════════════════════════════════════════════════
 
-# 我的技能 操作手册
+class PluginTool:
+    """把一个「已启用」的可执行插件接进对话技能池。
 
-## 触发条件
-当用户提到哪些内容时使用本技能（与上方 trigger_keywords 保持一致）。
+    【为什么不把插件做成"提示词技能"】
+      它和内置技能的根本区别：内置技能是**指令**（skill.md 注入系统提示，
+      让 LLM 照着说），插件是**代码**（判定链上真跑，产出 findings 落在
+      plugin_findings 表里）。
+      PluginTool.execute() 不去"再解释一遍插件在干什么"，而是去读
+      **判定链已经跑出来的产物** —— 真实、确定性、和页面上看到的完全一致。
 
-## 操作步骤
-1. 第一步做什么
-2. 第二步做什么
+    【为什么不在对话里现场重跑插件】
+      现场重跑要重建 facts，而 facts 里的 zones 需要 accelerator.rules；
+      app 进程里初始化 accelerator 会拉起 Milvus（见 app.py:166 的注释：
+      启动即 import run.py 会锁冲突，所以刻意做成惰性）。为了回答一句提问
+      去初始化整条加速链，代价和收益完全不成比例。
+      更关键的是：插件**本来就在每批数据上自动跑过了**，产物已入库。
+      重跑一遍只会得到一个可能因规则版本不同而与页面不一致的结果 ——
+      那比不答更糟。
 
-## 输出规范
-- 回答应包含哪些内容、用什么格式呈现
-
-## 禁止事项
-- 禁止编造数据，一切以实际信息为准
-- 超出本技能范围的问题，如实说明或引导使用其它功能
-"""
-
-
-def _split_frontmatter(text: str) -> tuple[str, str, str]:
-    """拆 skill.md：返回 (frontmatter 文本, 正文, 元信息 dict)。格式不符抛 ValueError。"""
-    if not text.strip().startswith("---"):
-        raise ValueError("必须以 --- 开头编写 YAML 元信息（name / label / icon / trigger_keywords 等）")
-    parts = text.split("---", 2)
-    if len(parts) < 3 or not parts[1].strip():
-        raise ValueError("缺少或空的 YAML 元信息段，请用 --- 包裹")
-    fm, body = parts[1], parts[2]
-    meta = {}
-    for line in fm.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if ":" not in line:
-            continue
-        k, v = line.split(":", 1)
-        meta[k.strip().lower()] = v.strip()
-    return fm, body.strip(), meta
-
-
-def parse_skill_keywords(raw: str) -> list[str]:
-    """解析 trigger_keywords：支持逗号/中文顿号/换行分隔，以及 \"- item\" 列表。"""
-    keywords = []
-    for chunk in re.split(r"[,，、\n]+", raw or ""):
-        chunk = chunk.strip()
-        if chunk.startswith("- "):
-            chunk = chunk[2:].strip()
-        if chunk:
-            keywords.append(chunk)
-    return keywords
-
-
-def validate_custom_skill_md(text: str) -> dict:
-    """校验用户提交的 skill.md，返回规范化元信息与手册正文；不合法抛 ValueError。"""
-    fm, body, meta = _split_frontmatter(text)
-
-    name = (meta.get("name") or "").strip().lower()
-    if not re.fullmatch(r"[a-z][a-z0-9_]{0,30}", name):
-        raise ValueError("name 需为小写字母开头的英文标识（字母/数字/下划线，≤31 字符），如 my_skill")
-    if name in {s.name for s in ALL_SKILLS}:
-        raise ValueError(f"技能名 {name} 与内置技能冲突，请换一个（内置：{', '.join(s.name for s in ALL_SKILLS)}）")
-
-    label = (meta.get("label") or "").strip()
-    if not label or len(label) > 30:
-        raise ValueError("label（显示名）必填，且不超过 30 字")
-
-    icon = (meta.get("icon") or "🧩").strip()[:8]
-    if not icon:
-        icon = "🧩"
-
-    description = (meta.get("description") or "").strip()
-    if not description:
-        raise ValueError("description（技能说明）必填，用户会看到它")
-
-    try:
-        min_level = int(meta.get("min_level") or 1)
-    except (TypeError, ValueError):
-        raise ValueError("min_level 需为 1~10 的数字")
-    if not 1 <= min_level <= 10:
-        raise ValueError("min_level 需为 1~10")
-
-    keywords = parse_skill_keywords(meta.get("trigger_keywords") or "")
-    if not keywords:
-        raise ValueError("trigger_keywords（触发词）至少需要一个，用逗号分隔")
-
-    if not body:
-        raise ValueError("操作手册正文不能为空（触发条件/操作步骤/输出规范/禁止事项）")
-
-    return {
-        "name": name,
-        "label": label,
-        "icon": icon,
-        "description": description,
-        "min_level": min_level,
-        "trigger_keywords": keywords,
-        "manual_md": text.strip(),
-        "manual_body": body,
-    }
-
-
-class CustomSkill:
-    """用户自定义技能——LLM 驱动：命中触发词即路由到本技能，操作手册注入 LLM。
-
-    不执行任意代码（安全）：execute 返回 __OLLAMA__，由 ShipClaw 把
-    self.manual 注入系统提示，让 LLM 严格按手册作答。
+    deterministic = True：查询结果即最终答复，不让 LLM 加戏。
+    插件判定是附加结论，绝不能由 LLM 转述成"系统认定你违规"。
     """
+
     name = ""
     label = ""
     description = ""
     icon = "🧩"
     params = []
     min_level = 1
-    exp_reward = 6
-    MATCH_SCORE = 0.8  # 高于通用内置词匹配(0.7)，低于高特定内置匹配(0.85+)
+    exp_reward = 8
+    # 0.88：高于 regulation_qa / ship_query 的通用桶(0.85)，低于违规证据链(0.95)。
+    #
+    # 为什么必须高过 0.85：regulation_qa 对**任何**带法规味的问题都返回 0.85
+    # （它是个宽桶），而插件的命中是作者在 manifest 里逐字写的具体触发词。
+    # 用 0.82 时「禁渔区捕捞怎么判」会被 regulation_qa 以 0.85 压过去，
+    # 插件永远选不中 —— 那「AI 发现有用就用」就只是句空话。
+    #
+    # 代价要知道：插件把触发词写宽（比如只写「违规」）就会抢走大量提问。
+    # 触发词在插件页上可见可改，这是作者的责任，不是这里能兜住的。
+    MATCH_SCORE = 0.88
+    deterministic = True
 
-    def __init__(self, *, name, label, description, icon="🧩", min_level=1,
-                 trigger_keywords, manual_md, skill_id=None, status="active"):
-        self.name = name
+    # 与违规证据链技能同一个正则。不能用 \b：Python3 的 \w 含中文，
+    # "413570530的"里数字与"的"之间不构成词边界，会匹配失败。
+    MMSI_PATTERN = re.compile(r'(?<!\d)(\d{6,9})(?!\d)')
+
+    def __init__(self, *, name, label, description, icon="🧩",
+                 trigger_keywords, plugin_id=None, version=1):
+        self.name = f"plugin_{name}"      # 加前缀避免与内置技能重名
+        self.plugin_name = name
         self.label = label
         self.description = description
         self.icon = icon or "🧩"
-        self.min_level = int(min_level or 1)
-        self.trigger_keywords = [k.strip() for k in trigger_keywords if k and k.strip()]
-        # 存"正文"作手册（剥掉 frontmatter），供 _execute_skill 直接注入
-        self.manual = _strip_manual_body(manual_md)
-        self.skill_id = skill_id
-        self.status = status
+        self.trigger_keywords = [k.strip() for k in (trigger_keywords or []) if k and k.strip()]
+        self.plugin_id = plugin_id
+        self.version = version
 
     def match(self, message: str) -> float:
         msg = message.lower()
@@ -935,47 +864,107 @@ class CustomSkill:
         return 0.0
 
     def execute(self, message: str, context: dict) -> str:
-        # 纯 LLM 驱动：不查询数据，手册在 _execute_skill 注入
-        return "__OLLAMA__"
+        m = self.MMSI_PATTERN.search(message or "")
+        if not m:
+            return self._describe()
+        return self._for_ship(m.group(1), context.get("user_id") or "system")
+
+    # ── 两个分支 ──
+
+    def _describe(self) -> str:
+        """没给船号 → 说清这个插件判什么，并要一个 MMSI。"""
+        lines = [f"{self.icon} {self.label}（插件 v{self.version}）", "", self.description]
+        if self.trigger_keywords:
+            lines += ["", "触发词：" + "、".join(self.trigger_keywords)]
+        lines += ["", "它是**可执行插件**：每批数据导入时对所有船自动跑一遍，",
+                  "产物单独存放，不改变系统的基线结论（违规判定/风险等级仍由",
+                  "确定性引擎给出）。", "",
+                  "给我一个 MMSI，我把它对这艘船的判定结果调出来。"]
+        return "\n".join(lines)
+
+    def _for_ship(self, mmsi: str, user_id: str) -> str:
+        """给了船号 → 读判定链已经跑出来的产物。"""
+        try:
+            import pg_db
+            conn = pg_db.connect()
+            rows = conn.execute(
+                "SELECT mmsi, result, code, catalog_code, label, severity, confidence, "
+                "evidence, metric, metric_unit, span_json, regulation_ref, raise_risk_to, "
+                "error_text, analysis_time, plugin_version "
+                "FROM plugin_findings WHERE plugin_id = ? AND mmsi = ? "
+                "ORDER BY id DESC LIMIT 20",
+                (self.plugin_id, mmsi),
+            ).fetchall()
+            conn.close()
+        except Exception as e:
+            return f"读取插件判定记录失败：{e}"
+
+        head = f"{self.icon} {self.label} · MMSI {mmsi}"
+        if not rows:
+            return (f"{head}\n\n没有这艘船的插件判定记录。两种情况：\n"
+                    "  1. 这艘船还没进过判定流水线（先把含它的数据导进来）；\n"
+                    "  2. 跑过了，但该插件没有命中 —— 这是正常结果，"
+                    "插件只在确实符合条件时才产出条目。")
+
+        hits = [dict(r) for r in rows if (r["result"] or "") == "ok"]
+        fails = [dict(r) for r in rows if (r["result"] or "") != "ok"]
+
+        out = [head]
+        if hits:
+            out.append("")
+            for r in hits:
+                out.append(f"● {r['label'] or r['code']}（把握 {float(r['confidence'] or 0):.0%}，"
+                           f"严重度 {r['severity'] or '未标'}）")
+                if r["evidence"]:
+                    out.append(f"   依据：{r['evidence']}")
+                metric = r["metric"]
+                if metric:
+                    out.append(f"   实测量值：{float(metric):g} {r['metric_unit'] or ''}".rstrip())
+                if r["regulation_ref"]:
+                    out.append(f"   法规：{r['regulation_ref']}")
+                if r["raise_risk_to"]:
+                    out.append(f"   已将风险等级建议抬升至 {r['raise_risk_to']}")
+                out.append(f"   判定时间：{r['analysis_time'] or '未知'}")
+            out.append("")
+            out.append("以上是插件附加判定，不改变系统的基线结论。")
+        else:
+            out.append("")
+            out.append("跑过了，但该插件对这艘船没有命中。")
+
+        if fails:
+            out.append("")
+            out.append(f"（另有 {len(fails)} 次执行未成功，最近一次："
+                       f"{fails[0]['result']} {fails[0]['error_text'] or ''}）")
+        return "\n".join(out)
 
     @classmethod
-    def from_row(cls, row: dict) -> "CustomSkill":
+    def from_row(cls, row: dict) -> "PluginTool":
         return cls(
-            skill_id=row.get("id"),
-            name=row["name"],
-            label=row["label"],
-            description=row.get("description", ""),
-            icon=row.get("icon", "🧩"),
-            min_level=row.get("min_level", 1),
-            trigger_keywords=(row.get("trigger_keywords") or "").split(","),
-            manual_md=row.get("manual_md", ""),
-            status=row.get("status", "active"),
+            plugin_id=row.get("id"),
+            name=row.get("name") or "",
+            label=row.get("label") or "",
+            description=row.get("description") or "",
+            icon=row.get("icon") or "🧩",
+            trigger_keywords=[k for k in (row.get("trigger_keywords") or "").split(",") if k.strip()],
+            version=row.get("current_version") or 1,
         )
 
 
-def _strip_manual_body(md_text: str) -> str:
-    """去掉 skill.md 的 YAML frontmatter，返回手册正文。"""
-    try:
-        _fm, body, _meta = _split_frontmatter(md_text)
-        return body
-    except ValueError:
-        return md_text.strip()
+def load_enabled_plugins() -> list[PluginTool]:
+    """加载**已启用**的插件，供对话技能池使用。全局、不按用户（插件是全局共享的）。
 
-
-def load_user_custom_skills(user_id: str) -> list[CustomSkill]:
-    """加载用户的自定义技能（仅 active）；system/default/空 → 无。"""
-    if not user_id or user_id in ("system", "default"):
-        return []
+    取不到就返回空列表：插件层出任何问题都不该让对话用不了
+    （对齐 orchestrator「检索失败不影响主流程」的既有取舍）。
+    """
     try:
         import pg_db
+        from plugin_runtime import store
         conn = pg_db.connect()
-        rows = conn.execute(
-            "SELECT id, name, label, icon, description, min_level, trigger_keywords, manual_md, status "
-            "FROM custom_skills WHERE user_id = ? AND status = 'active' ORDER BY id",
-            (user_id,),
-        ).fetchall()
-        conn.close()
-        return [CustomSkill.from_row(r) for r in rows]
+        try:
+            rows = store.load_runnable(conn)
+        finally:
+            conn.close()
+        return [PluginTool.from_row(r) for r in rows]
     except Exception:
         return []
 
@@ -1022,13 +1011,13 @@ def match_best_skill(message: str, extra_skills: Optional[list[Any]] = None) -> 
 
     Args:
         message: 用户消息
-        extra_skills: 额外技能（如用户自定义技能 CustomSkill），与内置技能一起参与匹配
+        extra_skills: 额外技能（即已启用插件的 PluginTool），与内置技能一起参与匹配
 
     Returns:
         (skill, match_score) 匹配度最高的技能及其分数
 
-    平局规则：分数相同且一方是自定义技能时，**自定义技能优先**——
-    用户自己做的技能应盖过同分的内置/闲聊（如自定义"天气"0.8 vs 闲聊"今天"0.8）。
+    平局规则：分数相同且一方来自 extra_skills 时，**额外技能优先**——
+    判定链上真跑出来的结论应盖过同分的内置/闲聊（如插件"碰撞风险"0.8 vs 闲聊"今天"0.8）。
     """
     pool = list(ALL_SKILLS)
     extra_names = set()

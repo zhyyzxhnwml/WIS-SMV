@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json  # JSON编解码模块
 import os  # 操作系统接口（用于文件路径操作）
+import shutil  # 文件拷贝（回归闸门提交候选模型时要备份现役）
 import time  # 时间模块（用于时间戳和冷却计时）
 from pathlib import Path  # 路径操作类
 from typing import Any, Optional  # 类型提示
@@ -35,6 +36,25 @@ from typing import Any, Optional  # 类型提示
 TRAINING_DATA_FILE = "data/feedback_training_data.json"  # 训练数据本地JSON文件路径
 RETRAIN_THRESHOLD = 50  # 累积多少条新数据后触发增量训练
 RETRAIN_COOLDOWN = 3600  # 两次增量训练最小间隔（秒）
+MAX_KEPT_RECORDS = 5000  # 训练集文件最多保留多少条（只作审计；已用过的不会再训）
+
+# 分歧样本的权重。**原来是 3.0**：LLM 与 ML 不一致时把该样本权重放大 3 倍。
+# 这是错的 —— 不一致不等于 LLM 对。实测（data/logs/diag_feedback_effect.py，
+# 真标签喂进同一机制在所有臂上都落在 0~微负；LLM 标签的正负完全跟着 LLM 的报警
+# 倾向走：污染的 base prompt 臂 +0.120 / 修好的 fix 臂 −0.168，各 6/6 轮稳定）
+# 说明这套机制只会**忠实转述 LLM 的偏差**，而 3 倍权重恰好把偏差放大得最狠。
+# 改为不放大：回路只在"LLM 比 L2 多知道一点"时才该有增量，那应由闸门把关，
+# 不该由倍数制造。想恢复旧行为把这里设回 3.0。
+DISAGREEMENT_WEIGHT = 1.0
+
+# 增量训练的**回归闸门**：候选模型必须在冻结验证集上不劣于现役，才允许替换。
+# 文件格式 [{"feature_vector": [...], "label": "obvious_issue"}, ...]，标签是真值
+# （人标或基准真值），**不能**用 LLM 标签 —— 否则闸门只是又一次"LLM 教 LLM"。
+# 文件不存在或有效样本 < GATE_MIN_SAMPLES 时闸门失效并告警（保持向后兼容）。
+VALIDATION_FILE = "data/feedback_validation.json"
+GATE_TOLERANCE = 0.0      # 候选 AUC 允许比现役低多少（0 = 不许降）
+GATE_MIN_SAMPLES = 30     # 验证集少于此数则闸门不生效
+GATE_MIN_CLASSES = 5      # 两个类各至少这么多，否则 AUC 不稳，闸门不生效
 
 
 def _load_training_data() -> list[dict]:
@@ -96,9 +116,52 @@ def _set_last_retrain_time() -> None:
     Path("data/.last_retrain").write_text(str(time.time()))  # 写入当前时间戳
 
 
-def _do_incremental_training(model_path: str = "triage_model.txt") -> bool:
-    """执行增量训练——从本地文件取数据，更新模型。"""
-    records = _load_training_data()  # 加载训练数据
+def _gate_auc(model_path: str) -> Optional[float]:
+    """现役/候选模型在**冻结验证集**上的 AUC（风险类取最大概率，与 router 同口径）。
+
+    返回 None 表示闸门不可用（文件缺失、样本太少、只有一个类）。
+    """
+    try:
+        import numpy as np
+        from sklearn.metrics import roc_auc_score
+        from triage_engine.model import LABELS, TriageModel
+    except ImportError:
+        return None
+    path = Path(VALIDATION_FILE)
+    if not path.exists():
+        return None
+    try:
+        recs = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    X, y = [], []
+    risk = [LABELS.index(k) for k in ("has_risk", "obvious_issue", "needs_review")]
+    for r in recs:
+        fv, lab = r.get("feature_vector"), r.get("label")
+        if not fv or lab not in LABELS:
+            continue
+        X.append(list(fv))
+        y.append(0 if lab == "normal" else 1)
+    if len(y) < GATE_MIN_SAMPLES or sum(y) < GATE_MIN_CLASSES \
+            or (len(y) - sum(y)) < GATE_MIN_CLASSES:
+        return None
+    m = TriageModel(model_path=model_path)
+    if not m.is_fitted:
+        return None
+    p = m.predict_proba(np.array(X, dtype=np.float32))[:, risk].max(axis=1)
+    try:
+        return float(roc_auc_score(np.array(y), p))
+    except Exception:
+        return None
+
+
+def _do_incremental_training(model_path: str = "triage_model.txt",
+                             out_path: Optional[str] = None) -> bool:
+    """执行增量训练——从本地文件取数据，更新模型。
+
+    out_path 给出时训练结果写到这里（供回归闸门先试后提交），不动 model_path。
+    """
+    records = [r for r in _load_training_data() if not r.get("used")]  # 只训没用过的
     if len(records) < 10:  # 数据太少
         return False  # 不足10条，跳过训练
 
@@ -132,6 +195,13 @@ def _do_incremental_training(model_path: str = "triage_model.txt") -> bool:
 
     # 创建模型（加载已有模型或从头训练）
     model = TriageModel(model_path=model_path)  # 创建或加载三分类模型
+    dst = out_path or model_path  # 要么写候选文件（闸门先试），要么直接写现役
+    # ⚠ 必须先改 model_path 再训：`TriageModel.incremental_update` 结尾会
+    # `self.save(self.model_path)` **就地覆盖**它加载的那个文件。不改的话，
+    # 候选还没过闸门，现役就已经被替换掉了，闸门比较的是同一个文件（曾实测
+    # 打印出"现役 0.6195 → 候选 0.6195"这种恒等）。
+    if out_path:
+        model.model_path = str(dst)
 
     if model.is_fitted:  # 如果模型已训练过
         # 增量更新
@@ -142,19 +212,31 @@ def _do_incremental_training(model_path: str = "triage_model.txt") -> bool:
             learning_rate=0.02,  # 增量训练的学习率（较小值防止灾难性遗忘）
         )
         print(f"\n  [反馈] 增量训练完成: {len(X)} 条数据, "
-              f"模型现在 {model.model.num_trees() if model.model else 0} 棵树")
+              f"模型现在 {model.model.num_trees() if model.model else 0} 棵树"
+              f"{'  → 候选 ' + str(dst) if out_path and str(dst) != str(model_path) else ''}")
     else:  # 模型未训练过
         # 初始训练（首次没有模型时）
         from triage_engine.train import train_initial  # 导入初始训练函数
         # 合并已有的训练数据
         model = train_initial(  # 执行初始训练
-            output_path=model_path,  # 模型输出路径
+            output_path=str(dst),  # 模型输出路径
             n_samples=max(500, len(X)),  # 合成样本数（至少500）
         )
         print(f"\n  [反馈] 初始训练完成: {len(X)} 条真实 + 合成数据")
 
-    # 清空已使用的训练数据
-    _save_training_data([])  # 保存空列表，清空已使用的训练数据
+    # 标记已用（**不再清空** —— 清空会让回路只有最近 50 条的记性，而那 50 条里
+    # LLM 的当期偏差就成了全部训练信号）。records 是本次开头读出来的未使用子集，
+    # 而文件此后没有被改过，所以按下标顺序标记即可。
+    allrec = _load_training_data()
+    n_mark, i = 0, 0
+    while n_mark < len(records) and i < len(allrec):
+        if not allrec[i].get("used"):
+            allrec[i]["used"] = True
+            n_mark += 1
+        i += 1
+    if len(allrec) > MAX_KEPT_RECORDS:  # 只作审计用，别无限涨
+        allrec = allrec[-MAX_KEPT_RECORDS:]
+    _save_training_data(allrec)
     _set_last_retrain_time()  # 记录本次训练时间
     return True  # 返回训练成功
 
@@ -169,7 +251,7 @@ def check_and_retrain(model_path: str = "triage_model.txt", force: bool = False)
     Returns:
         是否执行了训练
     """
-    records = _load_training_data()  # 加载训练数据
+    records = [r for r in _load_training_data() if not r.get("used")]  # 未用过的新数据
     count = len(records)  # 新数据条数
 
     if count < RETRAIN_THRESHOLD and not force:  # 未达到阈值且非强制
@@ -183,7 +265,47 @@ def check_and_retrain(model_path: str = "triage_model.txt", force: bool = False)
         return False  # 跳过
 
     print(f"\n  [反馈] 触发增量训练: {count} 条新标注数据等待学习")
-    return _do_incremental_training(model_path)  # 执行增量训练
+
+    # ── 回归闸门：先训成候选文件，在冻结验证集上比过现役再提交 ──
+    # 没有它，回路就是纯增量替换 —— 实测 LLM 标签会让 L2 在 +0.12 ~ −0.17 之间
+    # 摆（正负取决于 LLM 当期报警倾向），等于让线上模型坐过山车。
+    cand = f"{model_path}.candidate"
+    if not _do_incremental_training(model_path, out_path=cand):  # 训候选
+        return False
+    auc_new, auc_old = _gate_auc(cand), _gate_auc(model_path)
+    if auc_new is None or auc_old is None:  # 闸门不可用
+        print(f"  [反馈] ⚠ 回归闸门不可用（{VALIDATION_FILE} 缺失或样本不足）"
+              f"，本次**不提交**候选模型 —— 宁可不学，也不许无据替换")
+        Path(cand).unlink(missing_ok=True)  # 删掉候选，保持现役不动
+        for f in (cand + ".meta.json",):
+            Path(f).unlink(missing_ok=True)
+        _set_last_retrain_time()  # 记时间，避免每轮都重训
+        return False
+    print(f"  [反馈] 闸门: 现役 AUC {auc_old:.4f} → 候选 {auc_new:.4f} "
+          f"(容差 {GATE_TOLERANCE:+.4f})")
+    if auc_new < auc_old - GATE_TOLERANCE:  # 候选更差 → 拒绝
+        print(f"  [反馈] ✗ 候选劣于现役，**拒绝替换**，保留原模型")
+        Path(cand).unlink(missing_ok=True)
+        Path(cand + ".meta.json").unlink(missing_ok=True)
+        _set_last_retrain_time()
+        return False
+    # 提交：备份现役，候选顶上去
+    try:
+        bak = f"{model_path}.bak"
+        if Path(model_path).exists():
+            shutil.copy2(model_path, bak)  # 备份（连 meta 一起，否则 .bak 载不回来）
+            if Path(model_path + ".meta.json").exists():
+                shutil.copy2(model_path + ".meta.json", bak + ".meta.json")
+        shutil.copy2(cand, model_path)  # 候选 → 现役
+        if Path(cand + ".meta.json").exists():
+            shutil.copy2(cand + ".meta.json", model_path + ".meta.json")
+        for f in (cand, cand + ".meta.json"):
+            Path(f).unlink(missing_ok=True)
+        print(f"  [反馈] ✓ 候选通过闸门，已替换现役（旧模型备份为 {bak}）")
+    except Exception as e:
+        print(f"  [反馈] 提交候选失败: {e}，保留原模型")
+        return False
+    return True
 
 
 # ── 反馈闭环 ──
@@ -243,7 +365,17 @@ class FeedbackLoop:
             "added_to_training": False,  # 是否已添加到训练集
             "triggered_update": False,  # 是否触发了增量更新
             "needs_human_review": False,  # 是否需要人工复核
+            "reason": "",  # 未入训练集时的原因（可观测，别静默丢）
         }
+
+        # ── 来源闸：只收**真的来自 LLM** 的判定 ──
+        # `llm_layer/handler.py` 在 Ollama 不可用 / 调用异常 / 解析失败时返回的是
+        # 兜底字典（带 error、risk_unverified=True、confidence=0.0）。那不是 LLM 的
+        # 判定，可 `_llm_to_label` 会把它映射成 needs_review 收进训练集 ——
+        # 等于每次 LLM 抖一下就往 L2 里塞一条假标签。这里直接拒收。
+        if llm_result.get("error") or llm_result.get("risk_unverified"):
+            result["reason"] = "LLM 判定不可用（兜底结果），不入训练集"
+            return result
 
         llm_violation = llm_result.get("violation_detected", False)  # LLM判定的违规标记
         ml_thinks_issue = ml_prediction in ("obvious_issue", "has_risk", "needs_review")  # ML认为有问题的路由类型
@@ -252,7 +384,7 @@ class FeedbackLoop:
 
         # 确定训练集标签
         label = self._llm_to_label(llm_result, ml_prediction)  # 将LLM结果映射为训练标签
-        weight = 3.0 if not agreement else 1.0  # 分歧样本权重3倍于普通样本
+        weight = DISAGREEMENT_WEIGHT if not agreement else 1.0  # 分歧不再放大（见文件头说明）
 
         # 标记需人工复核（分歧样本）
         if not agreement:  # LLM与ML结论不一致
@@ -301,6 +433,10 @@ class FeedbackLoop:
             )
             result["added_to_training"] = True  # 标记已添加到训练集
             self._pending_count += 1  # 待处理计数加1
+        elif not result["added_to_training"] and not feature_vector:
+            # 静默丢记录是这套回路最容易踩的坑：orchestrator.py 那一侧就是不传
+            # feature_vector 的。留个痕，别再"看起来在工作其实一条没进"。
+            result["reason"] = "无 feature_vector 且无 pgvector → 文件模式无法入库，记录被丢弃"
 
         return result  # 返回处理结果
 

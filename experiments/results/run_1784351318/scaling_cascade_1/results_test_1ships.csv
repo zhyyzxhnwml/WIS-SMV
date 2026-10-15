@@ -1,2 +1,0 @@
-﻿mmsi,source_file,analysis_time,violation_detected,violation_type,violation_label,confidence,risk_level,routing,recommended_action,final_assessment,errors
-413773555,,2026-07-18 13:13:13,False,,分析异常,0.00%,low,obvious_issue,manual_review,因模型调用异常，无法完成分析, (status code: 502)

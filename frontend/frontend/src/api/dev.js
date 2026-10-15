@@ -33,13 +33,8 @@ export function fetchProviders() {
   return get('/dev/providers')
 }
 
-// 预设提供商目录（DeepSeek / 智谱 / 通义 …）：登录即可读，里面只有公开的地址与模型名。
-export function fetchProviderPresets() {
-  return get('/dev/provider-presets')
-}
-
-// 载荷里带 preset 时，缺的字段由预设补齐（只补不覆盖），所以
-// {preset: 'deepseek', api_key: 'sk-…'} 就够建一条完整档案。
+// 新增提供商（需超管）。厂商预设已在启动时全部补进档案，页面上就地填密钥即可；
+// 这里只用于「自定义 / 其他」这类目录里没有的地址。
 export function createProvider(data) {
   return post('/dev/providers', data)
 }
@@ -70,36 +65,74 @@ export function saveBindings(bindings) {
   return put('/dev/bindings', bindings)
 }
 
-// ── 开发者模式：自定义技能（skill.md） ──
+// ── 可执行插件（阶段 2：dsh 风格，manifest + Python 判定代码） ──
+//
+// 权限分两层（后端 @perm_required）：
+//   plugin.draft   —— 所有角色：新建、编辑、校验、试跑、让 AI 起草
+//   plugin.publish —— 仅超级管理员：启用、停用、回滚、删除
+// 草稿不参与线上判定；**启用后跑的是真代码且全局生效**，所以那条线收紧到超管。
+//
+// 传参说明：编辑是「manifest 一块 + 源码一块」两个输入框，所以这里传
+// { manifest_yaml, source_py }；后端会用 manifest.compose_plugin_file 拼回全文。
+// 手写字符串拼 `---` 差一个就会变成「缺少 manifest 段」，那种报错看不出是拼接问题。
 
-export function fetchSkillTemplate() {
-  return get('/dev/skills/template')
+export function fetchPlugins() {
+  return get('/dev/plugins')
 }
 
-export function validateSkill(skillMd) {
-  return post('/dev/skills/validate', { skill_md: skillMd })
+export function fetchPluginTemplate() {
+  return get('/dev/plugins/template')
 }
 
-export function fetchSkills() {
-  return get('/dev/skills')
+export function fetchPlugin(pid) {
+  return get(`/dev/plugins/${pid}`)
 }
 
-export function fetchSkill(sid) {
-  return get(`/dev/skills/${sid}`)
+export function fetchPluginVersions(pid) {
+  return get(`/dev/plugins/${pid}/versions`)
 }
 
-export function createSkill(skillMd) {
-  return post('/dev/skills', { skill_md: skillMd })
+export function fetchPluginVersion(pid, version) {
+  return get(`/dev/plugins/${pid}/versions/${version}`)
 }
 
-export function updateSkill(sid, skillMd) {
-  return put(`/dev/skills/${sid}`, { skill_md: skillMd })
+export function fetchPluginFindings(pid, limit = 50) {
+  return get(`/dev/plugins/${pid}/findings?limit=${limit}`)
 }
 
-export function setSkillStatus(sid, status) {
-  return put(`/dev/skills/${sid}`, { status })
+export function createPlugin(payload) {
+  return post('/dev/plugins', payload)
 }
 
-export function deleteSkill(sid) {
-  return del(`/dev/skills/${sid}`)
+export function updatePlugin(pid, payload) {
+  return put(`/dev/plugins/${pid}`, payload)
+}
+
+export function validatePlugin(pid, payload = {}) {
+  return post(`/dev/plugins/${pid}/validate`, payload)
+}
+
+export function trialPlugin(pid, payload = {}) {
+  return post(`/dev/plugins/${pid}/trial`, payload)
+}
+
+export function enablePlugin(pid, canRaiseRisk = false) {
+  return post(`/dev/plugins/${pid}/enable`, { can_raise_risk: canRaiseRisk })
+}
+
+export function disablePlugin(pid) {
+  return post(`/dev/plugins/${pid}/disable`)
+}
+
+export function rollbackPlugin(pid, version) {
+  return post(`/dev/plugins/${pid}/rollback`, { version })
+}
+
+export function deletePlugin(pid) {
+  return del(`/dev/plugins/${pid}`)
+}
+
+// 让 AI 造一个插件草稿。同步接口，可能跑几十秒（生成 → 校验 → 试跑 → 重试）。
+export function forgePlugin(message) {
+  return post('/ai/plugins/forge', { message })
 }

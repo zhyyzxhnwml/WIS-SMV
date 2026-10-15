@@ -275,13 +275,16 @@ def build_evidence_data(mmsi: str, row: dict, detail: dict) -> dict:
         "recommended_action": (row.get("recommended_action") or "").strip(),
     }
     try:
+        # 白名单取自 violation_catalog.CANONICAL（全部规范违规码）+ rule_hit。
+        # 手写类型元组不会崩，但新加的违规码要到不了这里的中文标签就被静默
+        # 过滤出证据面板——正是"类型加了却看不见"的老毛病。
+        from ais_accelerator.violation_catalog import CANONICAL  # 全部规范违规码
+
+        violation_types = set(CANONICAL) | {"rule_hit"}  # 事件类 + 规则命中类标注
         anns = json.loads(row["annotations"]) if row.get("annotations") else []
         data["annotations"] = sorted({
             a.get("label") for a in anns
-            if (a.get("label") or "") and a.get("type") in (
-                "speed_violation", "low_speed_fishing", "restricted_area_entry",
-                "ais_gap", "position_jump", "course_anomaly", "rule_hit",
-            )
+            if (a.get("label") or "") and a.get("type") in violation_types
         })[:8]
     except Exception:
         data["annotations"] = []

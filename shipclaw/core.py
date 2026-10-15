@@ -31,7 +31,7 @@ from .skills import (
     match_best_skill,
     CasualChatSkill,
     load_skill_manual,
-    load_user_custom_skills,
+    load_enabled_plugins,
 )
 
 
@@ -79,16 +79,26 @@ class ShipClaw:
                 "structured": 结构化证据数据（违规证据链技能；其余为 None）
             }
         """
+        # 0. 造插件意图 —— 必须在技能匹配**之前**拦截。
+        #
+        # 不把它做成一个 Skill 的理由：造插件是**元操作**，它的产物会成为技能池里的
+        # 新成员。放进同一个池子里，「做个禁渔区插件」和「禁渔区怎么判」词面高度重叠
+        # （都含"禁渔区"），谁赢全靠权重调参，很脆。这里用确定性关键词显式拦截。
+        from plugin_runtime import detect_forge_intent, forge_plugin
+        if detect_forge_intent(message):
+            return self._forge(user_id, message)
+
         # 1. 加载人格和偏好
         personality = self.claw_memory.load_personality(user_id)
         preferences = self.claw_memory.load_preferences(user_id)
         chat_context = self.claw_memory.get_chat_context(user_id)
 
-        # 2. 技能匹配（内置 + 该用户自定义技能）
-        custom_skills = load_user_custom_skills(user_id)
-        skill, match_score = match_best_skill(message, custom_skills)
+        # 2. 技能匹配（内置 + 已启用的可执行插件）
+        #    插件是**全局**的（不按用户），与「全局共享，超管启用」的作用域一致。
+        extra_skills = load_enabled_plugins()
+        skill, match_score = match_best_skill(message, extra_skills)
         intended_skill = skill  # 记录用户真正想触发的工具（可能因等级锁定而降级）
-        # 自定义技能用自身 min_level 判定解锁；内置技能走人格等级表
+        # 插件自带 min_level 判定解锁；内置技能走人格等级表
         if hasattr(skill, "min_level"):
             locked = personality.level < skill.min_level
         else:
@@ -171,6 +181,86 @@ class ShipClaw:
             "growth_event": growth_event,
             "structured": structured_data,   # 结构化证据数据（违规证据链技能），无则为 None
             "blocks": blocks or None,        # 渲染型工具产出的渲染块（chart/table/doc），无则为 None
+        }
+
+    def _forge(self, user_id: str, message: str) -> dict[str, Any]:
+        """造插件意图的独立返回路径：不走技能匹配、不加经验、不写对话记忆。
+
+        为什么不加经验：造插件是一次性的管理动作，不是「使用技能」。
+        给它记经验会让养成曲线被刷（连说十遍"做个插件"就升级了）。
+        为什么不写记忆：草稿内容会污染后续对话上下文。
+        """
+        from plugin_runtime import forge_plugin
+
+        try:
+            import pg_db
+            row = pg_db.connect().execute(
+                "SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+            username = (row["username"] if row else "") or ""
+        except Exception:
+            username = ""
+
+        result = forge_plugin(user_id, message, username=username)
+
+        if result.get("ok"):
+            reply = (
+                f"🧩 插件草稿已生成：**{result['label']}**（`{result['name']}`）\n\n"
+                f"· 生成轮次：{result['attempts']} 次"
+                + (f"（前 {result['attempts'] - 1} 次没过校验，已按报错重写）"
+                   if result["attempts"] > 1 else "") + "\n"
+                f"· 静态校验：AST {result['validation'].get('ast_nodes', '?')} 节点，"
+                f"注册工具 {result['validation'].get('registered_tools', [])}\n"
+                f"· 动态试跑：{len(result.get('trial') or [])} 份样本全部通过"
+                f"（含「不该命中」的样本）\n\n"
+                "草稿**还没有生效**——造出来的插件不会自动上线，"
+                "得由超级管理员过目后手动点「启用」。\n"
+                "点下面的「查看草稿」可以直接跳到它的行上。\n"
+                "启用后**对所有用户生效**：所有人的判定批次都会跑它。"
+            )
+        else:
+            # 按 kind 分别解释。四种失败的**成因完全不同**，用同一段「换个说法」
+            # 兜住全部，等于对系统故障说「是你需求写得不好」——用户会照做着改半天
+            # 而不可能改好。（2026-10-10：一个模板里的 KeyError 被这样包装了。）
+            kind = result.get("kind") or "internal"
+            if kind == "validation":
+                why = ("模型写的代码没过校验（导入白名单、禁用名字、双下划线属性），"
+                       "或者判定写成了「恒真」——任何输入都返回违规，"
+                       "被内置的对照样本挡下了。\n"
+                       "可以换个说法再试一次，把判定条件讲具体些"
+                       "（比如「区内停留超过 20 分钟且平均速度低于 3 节」）。")
+            elif kind == "duplicate":
+                why = "系统里已经有同名插件了。换个名字，或直接编辑已有的那一个。"
+            elif kind == "model":
+                # forge 已经把具体成因写进 error 了（超时 / 连不上 / 截断 / 格式），
+                # 这里只需点明「不是你的写法问题」并给出改的地方。
+                why = ("这条不是你的需求写法问题 —— 具体成因见上面那行。\n"
+                       "「起草」用途用的模型可以在「开发者 → 提供商」里换。")
+            else:
+                why = ("这是系统内部故障，**不是你的描述问题**——换个说法也一样。\n"
+                       "服务端日志里有完整堆栈，麻烦把它发给开发者。")
+            reply = ("插件没能生成出来。\n\n"
+                     f"原因：{result.get('error') or '未知'}\n\n" + why)
+        return {
+            "reply": reply,
+            "skill": "plugin_forge",
+            "tool_calls": [{
+                "name": "plugin_forge",
+                "label": "AI 造插件",
+                "description": "根据自然语言需求生成可执行判定插件草稿",
+                "icon": "🧩",
+                "params": [],
+                "status": "ok" if result.get("ok") else "fail",
+                "summary": (result.get("name") or result.get("error") or "")[:120],
+            }],
+            "level": None,
+            "exp_gained": 0,
+            "level_up": False,
+            "personality": None,
+            "growth_event": None,
+            "structured": None,
+            "blocks": None,
+            # 前端据此渲染「查看草稿」按钮，跳到 /dev?tab=plugins
+            "forge": result if result.get("ok") else None,
         }
 
     @staticmethod

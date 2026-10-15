@@ -32,3 +32,14 @@ _diag/
 .DS_Store
 Thumbs.db
 *.log
+
+# ── 第三方论文与数据集（版权原因不入库）──
+# 这里放的是别人发表的论文 PDF 及其开源代码副本（R-Judge / AgentHarm /
+# AgentAuditor / GuardAgent / AgentDojo，共 60 MB）。它们既不是本项目的代码，
+# 也没有再分发许可，推到公开仓库等于二次分发。需要这些材料的人按 README 里的
+# 出处自行下载。
+实验数据/
+
+# ── 模型备份 ──
+triage_model.txt.bak-*
+triage_model.txt.meta.json.bak-*

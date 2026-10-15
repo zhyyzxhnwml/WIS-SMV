@@ -8,7 +8,7 @@ permissions.py — 权限点定义与三个内置角色的固定权限集
 
 【为什么需要它？】
   现有鉴权是 8 处 @role_required("管理员","超级管理员") 的字符串比较（app.py:238-262）。
-  新增的两处收紧（provider 管理含 API 密钥、规则包激活影响全局判定）用角色串表达
+  新增的两处收紧（provider 管理含 API 密钥、插件启用影响全局判定）用角色串表达
   会越写越糊，且无法回答「这个角色到底能干什么」。权限点让这件事可枚举、可展示、可审计。
 
 【明确不做】
@@ -46,10 +46,10 @@ ROLE_LABELS: dict[str, str] = {
 ROLE_DESCRIPTIONS: dict[str, str] = {
     ROLE_SUPER: "系统所有者。独占用户管理（创建/停用/改角色/重置密码），"
                 "并拥有全部权限。",
-    ROLE_ADMIN: "业务负责人。管本组织与成员、审批规则包激活、配置模型与提供商、"
+    ROLE_ADMIN: "业务负责人。管本组织与成员、配置模型与提供商、"
                 "查看审计日志；不能管理用户账号。",
     ROLE_USER: "一线业务人员（只读的领导也用它）。查违规、看证据、导出报告、上传数据、"
-               "用智能体问数；可起草与试运行规则包，但不能激活。",
+               "用智能体问数；可让 AI 起草与试运行插件，但不能启用。",
 }
 
 
@@ -69,11 +69,13 @@ PERMISSIONS: list[dict] = [
     {"key": "violation.view",   "label": "查看违规数据",   "group": "数据"},
     {"key": "violation.export", "label": "导出违规报告",   "group": "数据"},
     {"key": "data.upload",      "label": "上传 AIS 数据",  "group": "数据"},
-    # 违规判定规则包
-    {"key": "rulepack.draft",   "label": "起草与试运行规则包", "group": "规则包",
-     "desc": "可自由起草、校验、试运行；不影响线上判定结果"},
-    {"key": "rulepack.publish", "label": "激活/停用/回滚规则包", "group": "规则包",
-     "desc": "改动会写入进程级全局分类目录，影响所有用户的判定结果，故收紧到管理员"},
+    # 可执行插件（阶段 2：dsh 风格，manifest + Python 判定代码）
+    # 命名说明：这两个键曾是预声明的 rulepack.*，从未被任何代码写入过，故直接改名 ——
+    # 用户与 UI 的词汇都是「插件」，留两套并行权限点会让「这角色到底能干什么」答不清。
+    {"key": "plugin.draft",   "label": "起草/编辑/试跑插件", "group": "插件",
+     "desc": "可自由生成、校验、试跑；草稿不参与线上判定，故对所有角色开放"},
+    {"key": "plugin.publish", "label": "启用/停用/回滚插件", "group": "插件",
+     "desc": "启用后插件对所有用户的判定生效且跑的是真代码，故收紧到超级管理员"},
     # 模型
     {"key": "model.config",     "label": "配置模型与提供商", "group": "模型",
      "desc": "含 API 密钥的读写，故收紧到管理员"},
@@ -99,12 +101,14 @@ _USER_PERMISSIONS = [
     "violation.view",
     "violation.export",
     "data.upload",
-    "rulepack.draft",     # 可起草、试运行，但不能激活
+    "plugin.draft",       # 可让 AI 起草、编辑、试跑，但不能启用
 ]
 
+# 注意 plugin.publish 不在这里。用户原话是「全局共享，**超管**启用」——
+# 插件跑的是真代码、启用后影响所有人的判定，比原来的 rulepack.publish 更该收紧。
+# 超管通过 ROLE_SUPER = list(PERMISSION_KEYS) 自动拥有它。
 _ADMIN_PERMISSIONS = [
     *_USER_PERMISSIONS,
-    "rulepack.publish",
     "model.config",
     "org.manage",
     "audit.view",

@@ -56,9 +56,12 @@ RISK_GRADING_STANDARD = """
 
 【风险等级分级标准（risk_level 必须严格按此标准判定，不要主观发挥）】
 - high（高风险）：仅限以下情形——进入禁航/限制区域；构成碰撞危险（DCPA<0.5海里且TCPA<12分钟）；禁渔区内违规捕捞且证据点充分；区域超速且最高速超过限速20%以上；AIS长时间（>2小时）蓄意关闭伴随逃避监管特征。
-- middle（中风险）：其余一切违规情形——AIS信号异常/缺失、位置跳变、航向异常、超速未超限速20%、低速捕捞嫌疑、证据不足的疑似违规行为。
+- mid（中风险）：其余一切违规情形——AIS信号异常/缺失、位置跳变、航向异常、超速未超限速20%、低速捕捞嫌疑、证据不足的疑似违规行为。
 - low（低风险）：未检测到违规（violation_detected=false 时固定输出 low）。
-判定优先级：违规类型危害性 > 证据充分度 > 持续时长。证据不足时不得判 high，宁可判 middle。
+判定优先级：违规类型危害性 > 证据充分度 > 持续时长。证据不足时不得判 high，宁可判 mid。
+注意：risk_level 的词表是 {{high, mid, low}}。不要写 "middle"/"medium"——
+"middle" 是**事件优先级**（EventPriority）的词表，两者只是恰好同名；写混会让
+仪表盘的风险饼图把同一档拆成两个扇区（实测出现过 middle=7 与 mid=2 并存）。
 """
 
 
@@ -96,10 +99,10 @@ FAST_CONFIRM_PROMPT = _fmt("""你是船舶违规检测专家。系统预处理�
 ```json
 {
   "violation_detected": true 或 false,
-  "violation_type": "违规代码",
+  "violation_type": "必须精确取自下方词表的 code",
   "violation_label": "中文描述",
   "confidence": 0.0-1.0,
-  "risk_level": "high/middle/low",
+  "risk_level": "high/mid/low",
   "agrees_with_triage": true/false,
   "disagreement_reason": "如果不一致，说明原因",
   "final_assessment": "简要判定说明（1-2句话）",
@@ -153,10 +156,10 @@ CAREFUL_REVIEW_PROMPT = _fmt("""你是船舶违规检测专家。系统标记这
 ```json
 {
   "violation_detected": true 或 false,
-  "violation_type": "违规代码",
+  "violation_type": "必须精确取自下方词表的 code",
   "violation_label": "中文描述",
   "confidence": 0.0-1.0,
-  "risk_level": "high/middle/low",
+  "risk_level": "high/mid/low",
   "agrees_with_triage": true/false,
   "disagreement_reason": "如果不一致，详细说明推翻预判的原因",
   "final_assessment": "综合判定说明（2-3句话，描述审查过程）",
@@ -204,10 +207,10 @@ NEEDS_REVIEW_PROMPT = _fmt("""你是船舶违规检测专家。系统无法自�
 ```json
 {
   "violation_detected": true 或 false,
-  "violation_type": "违规代码",
+  "violation_type": "必须精确取自下方词表的 code",
   "violation_label": "中文描述",
   "confidence": 0.0-1.0,
-  "risk_level": "high/middle/low",
+  "risk_level": "high/mid/low",
   "agrees_with_triage": true/false,
   "disagreement_reason": "说明推翻/确认预判的原因",
   "final_assessment": "综合判定说明（3-5句话，包含对不确定因素的分析）",
@@ -263,9 +266,81 @@ QUICK_VERIFY_PROMPT = _fmt("""你是船舶违规检测专家。系统判定这�
 """) + RISK_GRADING_STANDARD  # 快速验证Prompt模板（对应 normal 路由）
 
 
+# ── 违规类型词表注入 ────────────────────────────────────────────────
+# violation_type 原先在模板里写作 "违规代码"——一个**没有可选值**的占位符，
+# 于是 LLM 只能自创。实测同一批数据里出现过 AIS01 / AIS012 / AIS1001 /
+# data_quality_non_increasing_time / ais异常关闭 等十余种写法；这些脏码一路写进
+# CSV，又作为弱标签回流去训 L2 的 LightGBM（llm_layer/feedback.py），
+# 等于让模型去学一个并不存在的类别体系。
+#
+# 词表在 handler 侧以 {violation_vocab} 注入，不在此处 import 违规目录：
+# ais_accelerator 的 __init__ 会把整个包拉起来（实测 2.8s），且会反转 L3→L1 的分层。
+#
+# 只注入到真正需要 LLM 输出违规码的三个模板：quick_verify 走 normal 路由、
+# violation_type 固定为 null，给它加词表纯属给最便宜的路径加 token——
+# 而成本-质量帕累托正是本文的核心指标之一。
+_VOCAB_BLOCK = """
+【违规类型词表（violation_type 必须精确取其中一个 code，禁止自创）】
+{violation_vocab}
+"""
+
+_JSON_MARKER = "【输出要求 - 严格按 JSON 格式】"
+
+
+def _inject_vocab(t: str) -> str:
+    """把词表块插到 JSON 输出要求之前。
+
+    {violation_vocab} 保持字面量交给 handler 的 .format() 填充——此处已在
+    _fmt() 之后，插进来的花括号不会被转义，正是所需。
+    """
+    return t.replace(_JSON_MARKER, _VOCAB_BLOCK.strip() + "\n\n" + _JSON_MARKER, 1)
+
+
+# ── 判性依据注入 ────────────────────────────────────────────────────
+# 【为什么需要】原先四个模板给 LLM 的只有：事件**名字**（"碰撞风险 @ 某区域"）、
+# 规则命中的**标签**（"违规追越"）、和一段被截到 8000 字符的轨迹 JSON ——
+# 而 L1 实际测到的量值（DCPA、实测最小间距、速差、超速比例）、23 维窗口特征
+# （含 min_sep_nm）、航速统计、以及 L2 的风险分，**一个都没进 prompt**。
+# 于是 LLM 被要求判违规，却拿不到判据；再拿它的表现当"LLM 不行"的证据，
+# 不成立。这一段把判据和判定纪律一起补回去。
+#
+# 放在【相关法规】之前：法规是"该怎么做"，实测是"实际做了什么"，
+# 先看事实再对照规则，顺序与人的判案顺序一致。
+_EVIDENCE_BLOCK = """【判性依据：上游实测（先读这一段，结论必须落到数字上）】
+{triage_context}
+
+{measured_evidence}
+
+判定纪律（违反此条的结论视为无效）：
+1. 判 violation_detected=true，必须在 final_assessment 里落到**可复核的依据**上：
+   要么是某个量值越过了某条门槛（DCPA<0.5 海里且 TCPA<12 分钟、实测最小间距过小、
+   追越速差≥5 节、最高速超限速 20% 以上、信号缺失>2 小时），要么是第 3 条所说的、
+   能从轨迹点名到时间与位置的行为事实。两者都给不出，就不许判 true。
+2. 上面列出的量值**不足以支撑**任何一条门槛时，判 violation_detected=false，
+   并在 disagreement_reason 里说明缺哪项证据 —— 不要为了配合系统预判而编造量值，
+   也不要因为"系统标记了"就默认违规成立。
+3. **但"上游没命中"不等于"没有违规"**：L1 的硬证据清单是**有限的**（区域进入、
+   追越、越界锚泊、违规捕捞、让路未让、超速这几类），它没编码的行为正是要你来看的 ——
+   例如 COLREG 会遇局面与该让不让、违反分道通航制/航路规则、异常机动与徘徊、
+   与他船长时间伴随或并靠、以及上面量值正常但行为整体反常的情形。
+   在这些情形下，判 true 的依据是**轨迹本身可复核的事实**（时间、位置、航向/航速序列），
+   在 final_assessment 里把事实写清楚。
+4. 量值以本节为准；轨迹 JSON 是抽样且被截断的，看不出量值时不要靠它反推。
+
+"""
+
+
+def _inject_evidence(t: str) -> str:
+    """把判性依据块插到【相关法规】之前。`{triage_context}`/`{measured_evidence}`
+    同样保持字面量交给 handler 的 .format() 填充。"""
+    return t.replace("\n【相关法规】", "\n" + _EVIDENCE_BLOCK + "【相关法规】", 1)
+
+
 PROMPT_TEMPLATES = {  # 四级Prompt模板字典（路由名称→模板文本）
-    "fast_confirm": FAST_CONFIRM_PROMPT,  # 快速确认（明显问题）
-    "careful_review": CAREFUL_REVIEW_PROMPT,  # 仔细审查（有风险）
-    "needs_review": NEEDS_REVIEW_PROMPT,  # 全面审查（无法自动判定）
-    "quick_verify": QUICK_VERIFY_PROMPT,  # 快速验证（正常）
+    "fast_confirm": _inject_vocab(_inject_evidence(FAST_CONFIRM_PROMPT)),  # 快速确认（明显问题）
+    "careful_review": _inject_vocab(_inject_evidence(CAREFUL_REVIEW_PROMPT)),  # 仔细审查（有风险）
+    "needs_review": _inject_vocab(_inject_evidence(NEEDS_REVIEW_PROMPT)),  # 全面审查（无法自动判定）
+    # 快速验证（正常）：同样注入实测依据——"确认无异常"也是一个判定，
+    # 同样需要数字支撑；不注入词表（它不输出违规码）。
+    "quick_verify": _inject_evidence(QUICK_VERIFY_PROMPT),
 }

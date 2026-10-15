@@ -51,10 +51,28 @@ def _candidate_finding(event: CandidateEvent) -> str:  # 将候选事件类型�
         return (  # 拼接描述文本
             "低速疑似捕捞: "
             f"均速{_compact_number(features.get('average_speed', '未知'))}节, "  # 平均速度
-            f"最低{_compact_number(features.get('minimum_sp eed', '未知'))}节, "  # 最低速度
+            f"最低{_compact_number(features.get('minimum_speed', '未知'))}节, "  # 最低速度（原字段名拼错成 minimum_sp eed，永远取到"未知"）
             f"持续{_compact_number(features.get('duration_minutes', '未知'))}分钟"  # 持续时长
         )
+    if candidate_type == "illegal_fishing":  # 违规捕捞事件（禁渔区/禁渔期内的法定违规）
+        return (  # 拼接描述文本
+            "违规捕捞: "
+            f"在禁止捕鱼水域{event.zone_name or event.zone_id or ''}内低速作业"  # 区域名
+            f"{_compact_number(features.get('fishing_duration_minutes', '未知'))}分钟, "  # 作业时长（分档量值）
+            f"均速{_compact_number(features.get('average_speed', '未知'))}节, "  # 平均速度
+            f"作业前主流速{_compact_number(features.get('prior_median_speed', '未知'))}节"  # 事件前的正常航速
+        )
     if candidate_type == "speed_violation":  # 超速事件
+        # 判据有两路：区域限速（zone_limit）与数据驱动（absolute/relative 同水域主流速）
+        judge = features.get("judge")  # 判据来源
+        if judge in ("absolute", "relative"):  # 数据驱动：没有区域，参照物是同水域主流速
+            basis = "绝对异常" if judge == "absolute" else "远超同水域主流速"
+            return (  # 拼接描述文本
+                f"数据驱动超速({basis}): "
+                f"最高{_compact_number(features.get('max_speed', '未知'))}节, "
+                f"同水域主流速{_compact_number(features.get('reference_speed', '未知'))}节, "
+                f"判定阈值{_compact_number(features.get('speed_limit', '未知'))}节"
+            )
         return (  # 拼接描述文本
             "区域超速: "
             f"最高{_compact_number(features.get('max_speed', '未知'))}节, "  # 最高速度
@@ -62,8 +80,84 @@ def _candidate_finding(event: CandidateEvent) -> str:  # 将候选事件类型�
         )
     if candidate_type == "restricted_area_entry":  # 进入禁航区事件
         return f"进入限制区域: {event.zone_name or event.zone_id or '未知区域'}"  # 区域名称
+    if candidate_type == "overtaking_violation":  # 违规追越事件（COLREG 第13条）
+        return (  # 拼接描述文本
+            "违规追越: "
+            f"追越 {features.get('target_mmsi', '未知')} 时最近横距"  # 被追越船
+            f"{_compact_number(features.get('min_distance_nm', '未知'))}海里（安全线"
+            f"{_compact_number(features.get('unsafe_distance_nm', '未知'))}海里）, "  # 判定安全线
+            f"速度差{_compact_number(features.get('max_speed_diff_knots', '未知'))}节, "  # 峰值速度差
+            f"从被追越船船首{_compact_number(features.get('avg_relative_bearing', '未知'))}度方向赶上"  # 相对方位
+        )
+    if candidate_type == "wrong_way_navigation":  # 逆向航行事件（COLREG 第10条分道通航制）
+        return (  # 拼接描述文本
+            "逆向航行: "
+            f"偏离该水域主流向{_compact_number(features.get('course_offset_degrees', '未知'))}度, "  # 偏离角
+            f"持续{_compact_number(features.get('duration_minutes', '未知'))}分钟, "  # 持续时长
+            f"均速{_compact_number(features.get('average_speed', '未知'))}节"  # 平均速度
+        )
+    if candidate_type == "anchoring_out_of_bounds":  # 越界锚泊事件
+        return (  # 拼接描述文本
+            f"越界锚泊: {features.get('anchorage') or event.zone_name or '锚地'}内禁止锚泊, "  # 锚地名
+            f"已锚泊{_compact_number(features.get('anchoring_duration_minutes', '未知'))}分钟, "  # 锚泊时长
+            f"均速{_compact_number(features.get('average_speed', '未知'))}节"  # 平均速度（锚泊态应接近 0）
+        )
+    if candidate_type == "fairway_anchoring":  # 航道内锚泊事件（数据驱动航道走廊）
+        return (  # 拼接描述文本
+            "航道内锚泊: "  # 与越界锚泊的区别：不是在禁锚水域，而是在船队航行走廊里
+            f"位于航道走廊内, 已锚泊"  # 走廊来自实测密度，不是区域配置
+            f"{_compact_number(features.get('anchoring_duration_minutes', '未知'))}分钟, "  # 锚泊时长
+            f"均速{_compact_number(features.get('average_speed', '未知'))}节"  # 平均速度（锚泊态应接近 0）
+        )
+    if candidate_type == "collision_risk":  # 碰撞风险事件
+        return (  # 拼接描述文本
+            "碰撞风险: "
+            f"与 {features.get('target_mmsi', '未知')} 的最近会遇距离"  # 目标船
+            f"{_compact_number(features.get('dcpa_nm', '未知'))}海里, "  # DCPA
+            f"到最近会遇点{_compact_number(features.get('tcpa_minutes', '未知'))}分钟, "  # TCPA
+            f"碰撞风险指数{_compact_number(features.get('cri', '未知'))}"  # CRI
+        )
+    if candidate_type == "give_way_failure":  # 让路船未让路（COLREG 第13/14/15条，归责）
+        # encounter_type 在 features 里是英文码（"crossing"/"head_on"/"overtaking"），
+        # 这里翻成中文再拼进给 Agent 的文本，免得结语里冒英文词
+        encounter_label = {  # 相遇态势中文名
+            "overtaking": "追越",
+            "head_on": "对遇",
+            "crossing": "交叉相遇",
+        }.get(features.get("encounter_type"), "相遇")
+        return (  # 拼接描述文本
+            f"让路船未让路（{encounter_label}局面）: "
+            f"本船负有让路义务（COLREG 第{features.get('colreg_rule', '?')}条）, "  # 依据条款
+            f"与 {features.get('target_mmsi', '未知')} 实际最近通过"  # 对方船
+            f"{_compact_number(features.get('distance_nm', '未知'))}海里"  # **实测**最近距离（本码判据量）
+            f"（判据线{_compact_number(features.get('close_quarters_threshold_nm', '未知'))}海里）, "  # 紧迫局面距离线
+            # 这里刻意报实测距离而不是 dcpa_nm/tcpa_minutes：那两项是接近过程起点上的
+            # **预测**值（含义已写进 colreg.py 的 features 注释），给 Agent 读的文本里
+            # 用实测值，免得把"预测会靠多近"当成"实际靠了多近"。
+            f"接近前碰撞风险指数{_compact_number(features.get('cri', '未知'))}, "  # 起点无行动预测（细类档）
+            f"此前仅改向{_compact_number(features.get('course_alteration_degrees', '未知'))}度"  # 实际改向幅度
+            f"（应达{_compact_number(features.get('alteration_threshold_degrees', '未知'))}度）, "  # 判定阈值
+            f"速度变化{_compact_number(features.get('speed_change_knots', '未知'))}节"  # 速度变化
+        )
+    if candidate_type == "illegal_towing":  # 违规拖带/并靠事件
+        return (  # 拼接描述文本
+            "违规拖带/并靠: "
+            f"与 {features.get('target_mmsi', '未知')} 长时间保持"  # 对方船
+            f"{_compact_number(features.get('avg_separation_nm', '未知'))}海里间距"  # 平均间距
+            f"（最近{_compact_number(features.get('min_separation_nm', '未知'))}海里）, "  # 最近间距
+            f"速度差{_compact_number(features.get('speed_diff_knots', '未知'))}节, "  # 速度差
+            f"航向差{_compact_number(features.get('course_diff_degrees', '未知'))}度, "  # 航向差
+            f"持续{_compact_number(features.get('duration_minutes', '未知'))}分钟"  # 持续时长
+        )
     if candidate_type == "ais_gap":  # AIS信号中断事件
         return f"AIS信号中断: {json_compact(features)}"  # 特征详情
+    if candidate_type == "ais_off":  # AIS导航要素不可用事件（与 ais_gap 的区别：报文收到了）
+        return (  # 拼接描述文本
+            "AIS导航要素不可用: "
+            f"{features.get('unavailable_points', '未知')}个报文的位置/航向/航速整体为空值, "  # 不可用报文数
+            f"累计{_compact_number(features.get('unavailable_minutes', '未知'))}分钟, "  # 累计时长
+            f"涉及字段{','.join(features.get('unavailable_fields') or []) or '未知'}"  # 具体字段名
+        )
     if candidate_type == "position_jump":  # 位置跳变事件
         return f"位置跳变: {json_compact(features)}"  # 特征详情
     if candidate_type == "course_anomaly":  # 航向异常事件

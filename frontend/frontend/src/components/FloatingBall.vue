@@ -50,7 +50,10 @@
 import { ref, reactive, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import AppIcon from './AppIcon.vue'
 
-const FAB_W = 100
+// 悬浮球宽度。别当成常量手写死：这里原来写 100，实际渲染 110，而收起面板那边
+// 写 100、实际 104 —— 同一套 `innerWidth - FAB_W - 16` 于是算出了 16px 的错位，
+// 两个球叠在一起右边就不齐。改为挂载时按 DOM 实量（值本身只是首帧兜底）。
+let FAB_W = 100
 const FAB_H = 48
 const MIN_W = 320
 const MIN_H = 400
@@ -121,6 +124,8 @@ async function fetchData() {
 }
 
 onMounted(() => {
+  const fabEl = document.querySelector('.cascade-fab')
+  if (fabEl) FAB_W = fabEl.getBoundingClientRect().width
   pos.left = Math.max(0, window.innerWidth - FAB_W - 16)
   pos.top = 80
   fetchData()
@@ -173,7 +178,7 @@ function dragWindow(e) {
   const startLeft = pos.left, startTop = pos.top
   beginDrag(e, {
     move: (_ev, d) => {
-      pos.left = clamp(startLeft + d.dx, 0, window.innerWidth - 100)
+      pos.left = clamp(startLeft + d.dx, 0, window.innerWidth - FAB_W)
       pos.top = clamp(startTop + d.dy, 0, window.innerHeight - 80)
     }
   })
@@ -220,12 +225,15 @@ async function scrollToBottom() {
     100% { transform: translateX(100%); }
 }
 .cascade-fab:active { cursor: grabbing; transform: scale(1.02); }
-.fab-label { font-weight: 600; letter-spacing: 0.5px; }
+/* 几何量和 FloatingAIChat 的 .ai-fab 对齐（标签字号、徽章形状与偏移），
+   两个球上下叠着，差一档就参差。 */
+.fab-label { font-weight: 600; letter-spacing: 0.5px; font-size: 13px; }
 .fab-badge {
     position: absolute; top: -6px; right: -6px;
     background: linear-gradient(135deg, #ef5350, #ff8a65); color: #fff;
-    width: 20px; height: 20px; border-radius: 50%;
+    min-width: 20px; height: 20px; border-radius: 10px;
     display: flex; align-items: center; justify-content: center;
+    padding: 0 5px;
     font-size: 11px; font-weight: 700; border: 2px solid #fff;
     box-shadow: 0 2px 8px rgba(239, 83, 80, 0.5);
 }

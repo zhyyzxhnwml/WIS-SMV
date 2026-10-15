@@ -32,6 +32,13 @@ data/avatars
 data/ais.db
 data/ais.db.bak
 
+# 公开基准数据（论文实验用，运行时不需要）。
+# 实测这个目录有 2.6 GB（MarineCadastre AIS + NOAA MPA 边界 + GFW SAR 检测），
+# 不排除会整包进镜像：构建上下文和镜像体积各多 2.6 GB，而应用只读 data/geo、
+# data/llm_config.json 等种子文件，从不碰这里（全仓引用它的只有 experiments/ 与
+# benchmark/hawaii_eval.py，前者本就被排除）。
+data/public
+
 # 旧模型 / 备份
 triage_model_bad*
 *.bak

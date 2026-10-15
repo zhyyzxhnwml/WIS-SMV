@@ -9,7 +9,7 @@ llm_providers.py — 模型提供商注册表 + 用途绑定
     bindings   用途 → (提供商, 模型)。三个用途：
                  chat  对话与智能体（shipclaw / 后端兜底对话）
                  judge 级联判定 L3（llm_layer/handler.py）
-                 draft AI 起草规则包（阶段 2 接入，建议绑强模型）
+                 draft AI 起草可执行插件（plugin_runtime/forge.py，建议绑强模型）
 
 【为什么要有它？】
   原来只有一份 base_url + model（llm_config.py），换模型就是换全局。判定要用
@@ -25,12 +25,24 @@ llm_providers.py — 模型提供商注册表 + 用途绑定
   - embedding 模型/维度（regulation_db.py）：向量已钉死 1024，不在 UI 暴露。
 
 【持久化】
-  data/llm_providers.json  提供商档案
-  data/llm_bindings.json   用途绑定
+  data/llm_providers.json     提供商档案
+  data/llm_bindings.json      用途绑定
+  data/llm_dismissed_presets.json  被删掉的预设厂商 id（免得被目录补回来）
 
 【零配置】
   两个文件都不存在时，自动从 data/llm_config.json 迁出一个本地 Ollama 提供商，
   并把三个用途都绑到它 —— 所以「什么都不配」的行为与改造前逐字一致。
+
+【提供商目录是平铺的，没有「添加」这一步】
+  llm_presets.PRESETS 是厂商目录（DeepSeek / 智谱 / 通义…）。启动时 _seed_presets()
+  把目录里**还没有**的厂商补进档案，于是页面上一次就能看到全部厂商，
+  用户就地填密钥即可 —— 不再有「点添加提供商 → 选预设 → 才出现表单」这条两级路径。
+
+  两条必须守住的规矩：
+    1. 补进来的厂商一律 enabled=False。否则「第一个启用的提供商」回落会把 chat
+       指向一个还没有密钥的云端厂商，表现为「一说话就报未配置密钥」——
+       而现在只有本地 Ollama 是启用的，行为与改造前一致。填密钥保存时前端才置启用。
+    2. 删掉的厂商记进 dismissed_presets，否则下次启动又被补回来（删了又活）。
 """
 
 from __future__ import annotations
@@ -52,6 +64,8 @@ ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
 PROVIDERS_FILE = DATA_DIR / "llm_providers.json"
 BINDINGS_FILE = DATA_DIR / "llm_bindings.json"
+# 用户显式删掉的预设厂商 id：不记住的话每次启动都会被 _seed_presets 补回来
+DISMISSED_FILE = DATA_DIR / "llm_dismissed_presets.json"
 LEGACY_CONFIG_FILE = DATA_DIR / "llm_config.json"
 
 KINDS = ("ollama", "openai_compat", "anthropic")
@@ -61,7 +75,7 @@ KIND_LABELS = {
     "anthropic": "Anthropic（预留，未实装）",
 }
 PURPOSES = ("chat", "judge", "draft")
-PURPOSE_LABELS = {"chat": "对话与智能体", "judge": "级联判定", "draft": "规则包起草"}
+PURPOSE_LABELS = {"chat": "对话与智能体", "judge": "级联判定", "draft": "AI 起草（插件）"}
 
 # 与 llm_config.DEFAULT_CONFIG 保持一致：零配置时的本地 Ollama 档案
 DEFAULT_OLLAMA = {
@@ -81,6 +95,7 @@ DEFAULT_PARAMS = {
 _lock = threading.RLock()
 _providers: list[dict] = []
 _bindings: dict[str, dict] = {}
+_dismissed: set[str] = set()      # 被用户删掉的预设厂商 id
 _loaded = False
 
 
@@ -254,6 +269,9 @@ def _normalize_provider(raw: dict) -> dict | None:
         "enabled": bool(raw.get("enabled", True)),
         "capabilities": sorted(set(caps)),
         "params": _normalize_params(raw.get("params")),
+        # 这条档案来自哪个预设厂商（'' = 用户手填的自定义条目）。
+        # 用途有二：界面上按厂商分组、以及删除时记进 dismissed 免得被补回来。
+        "preset": str(raw.get("preset") or "").strip(),
     }
 
 
@@ -275,6 +293,9 @@ def _migrate_from_legacy() -> tuple[list[dict], dict]:
         "id": pid,
         "name": DEFAULT_OLLAMA["name"],
         "kind": "ollama",
+        # 认它是 ollama 预设的一条 —— 于是目录补种时不会再多出一条重复的本地 Ollama，
+        # 且用户删掉它之后不会再被补回来。
+        "preset": "ollama",
         "base_url": base_url,
         "models": [model],
         "enabled": True,
@@ -285,10 +306,51 @@ def _migrate_from_legacy() -> tuple[list[dict], dict]:
     return [provider], bindings
 
 
+def _seed_presets(provs: list[dict]) -> bool:
+    """把 llm_presets 目录里**还不在档案里**的厂商补进来（enabled=False）。返回是否补过。
+
+    判据是「同 id」或「同 kind + 同地址」或「已有某条认领了这个预设」——
+    最后一条是为了让迁移出来的 ollama-local 顶掉 ollama 预设，不再多出一条一样的。
+    补进来的都关着：目录只是「把可选项摆出来」，启用与否是用户填完密钥的事。
+    """
+    try:
+        import llm_presets
+    except Exception:
+        return False
+
+    have_ids = {p["id"] for p in provs}
+    have_preset = {p["preset"] for p in provs if p.get("preset")}
+    have_urls = {(p["kind"], p["base_url"].rstrip("/")) for p in provs if p["base_url"]}
+    added = False
+    for preset in getattr(llm_presets, "PRESETS", []):
+        pid = str(preset.get("id") or "")
+        if not pid or pid in have_ids or pid in have_preset or pid in _dismissed:
+            continue
+        url = str(preset.get("base_url") or "").rstrip("/")
+        if url and (preset.get("kind"), url) in have_urls:
+            continue
+        record = _normalize_provider({
+            "id": pid,
+            "name": preset.get("name"),
+            "kind": preset.get("kind"),
+            "base_url": url,
+            "models": list(preset.get("models") or []),
+            "enabled": False,          # 见模块头「两条必须守住的规矩」第 1 条
+            "capabilities": list(PURPOSES),
+            "preset": pid,
+        })
+        if record:
+            provs.append(record)
+            added = True
+    return added
+
+
 def _load():
-    """启动/重载：读两个 JSON；缺 providers 文件时走迁移。"""
-    global _providers, _bindings, _loaded
+    """启动/重载：读两个 JSON；缺 providers 文件时走迁移，然后把厂商目录补平。"""
+    global _providers, _bindings, _dismissed, _loaded
     migrated = False
+    raw_dismissed = _read_json(DISMISSED_FILE)
+    _dismissed = {str(x) for x in raw_dismissed} if isinstance(raw_dismissed, list) else set()
     raw = _read_json(PROVIDERS_FILE)
     if isinstance(raw, dict) and isinstance(raw.get("providers"), list):
         provs = [p for p in (_normalize_provider(x) for x in raw["providers"]) if p]
@@ -302,6 +364,11 @@ def _load():
 
     if not provs:
         provs, bnd = _migrate_from_legacy()
+        migrated = True
+
+    # 厂商目录补平：已有的（含上一个版本存下来的）一条都不动，只补缺的。
+    # 于是「老档案 + 新目录」也能在启动时自动长全，不需要一次显式迁移。
+    if _seed_presets(provs):
         migrated = True
 
     if bnd is None:
@@ -340,7 +407,8 @@ def save_all() -> str:
             "providers": copy.deepcopy(_providers),
         })
         err2 = _write_json(BINDINGS_FILE, copy.deepcopy(_bindings))
-        return err1 or err2
+        err3 = _write_json(DISMISSED_FILE, sorted(_dismissed))
+        return err1 or err2 or err3
 
 
 def reload():
@@ -355,17 +423,52 @@ def reload():
 # 读：给界面看的形状（永不含密钥原文）
 # ═══════════════════════════════════════════════════════════
 
+def _preset_of(p: dict) -> dict | None:
+    """取这条档案对应的预设（没有或目录读不到就 None）。"""
+    pid = p.get("preset")
+    if not pid:
+        return None
+    try:
+        import llm_presets
+        return llm_presets.get_preset(pid)
+    except Exception:
+        return None
+
+
+def _group_of(p: dict) -> tuple[str, str]:
+    """这条档案归到目录的哪一组（界面按组平铺展示）。认不出就落到「自定义」组。"""
+    group = (_preset_of(p) or {}).get("group") or ""
+    if group:
+        try:
+            import llm_presets
+            for g in llm_presets.PRESET_GROUPS:
+                if g["key"] == group:
+                    return group, g["label"]
+        except Exception:
+            pass
+    return ("local", "本地部署") if p["kind"] == "ollama" else ("other", "自定义 / 其他")
+
+
 def public_view(p: dict) -> dict:
     """一条档案的对外形状：密钥只给 has_key / key_hint / key_error。"""
     plain, err = decrypt_key(p.get("api_key_enc") or "")
     from_env = env_api_key(p["id"])
     effective = from_env or plain
+    group, group_label = _group_of(p)
     return {
         "id": p["id"],
         "name": p["name"],
         "kind": p["kind"],
         "kind_label": KIND_LABELS.get(p["kind"], p["kind"]),
         "base_url": p["base_url"],
+        "preset": p.get("preset") or "",
+        "is_preset": bool(p.get("preset")),
+        "group": group,
+        "group_label": group_label,
+        # 预设里那两句「去哪拿密钥 / 这家有什么坑」随档案一起给界面 ——
+        # 平铺之后没有「选预设」这一步了，这两句如果只留在目录里就等于丢了。
+        "doc_url": (_preset_of(p) or {}).get("doc_url") or "",
+        "preset_note": (_preset_of(p) or {}).get("note") or "",
         "effective_base_url": env_base_url(p["id"]) or p["base_url"],
         "models": list(p["models"]),
         "enabled": p["enabled"],
@@ -426,11 +529,29 @@ def _legacy_ollama_env() -> tuple[str, str]:
             os.environ.get("OLLAMA_MODEL", "").strip())
 
 
+def _effective_key(p: dict) -> str:
+    """这条档案实际能用的密钥：环境变量优先于落盘值。"""
+    plain, _err = decrypt_key(p.get("api_key_enc") or "")
+    return env_api_key(p["id"]) or plain
+
+
+def _usable(p: dict) -> bool:
+    """没有密钥就发不出请求。本地 Ollama 免密钥，其余都要。
+
+    **只用于回落**（见 resolve）。因为厂商目录现在是平铺的，档案里躺着十几个
+    还没填密钥的云端厂商；只要有人把它们设为启用，「第一个启用的提供商」就可能落到
+    一个没密钥的厂家上，表现为「一说话就报未配置密钥」——而且看起来像系统的错。
+    显式绑定不走这个判据：用户点名要谁就返回谁，宁可报一句清楚的错，
+    也不能悄悄换成别家（那正是本文件最想避免的「显示 A 打 B」）。
+    """
+    return p["kind"] == "ollama" or bool(_effective_key(p))
+
+
 def resolve(purpose: str = "chat") -> dict:
     """解析某个用途最终用哪个提供商与模型。
 
-    回落顺序：显式绑定 → 第一个启用且声明该能力的提供商 → 第一个启用的提供商
-    → 本地 Ollama 默认（保证任何情况下都有答案，调用方不必判空）。
+    回落顺序：显式绑定 → 第一个启用、有密钥且声明该能力的提供商 → 第一个启用且有密钥的
+    → 第一个启用的 → 本地 Ollama 默认（保证任何情况下都有答案，调用方不必判空）。
     """
     _ensure_loaded()
     with _lock:
@@ -438,7 +559,10 @@ def resolve(purpose: str = "chat") -> dict:
         b = _bindings.get(purpose) or {}
         chosen = next((p for p in provs if p["id"] == b.get("provider_id")), None)
         if chosen is None:
-            chosen = next((p for p in provs if p["enabled"] and purpose in p["capabilities"]), None)
+            chosen = next((p for p in provs if p["enabled"] and _usable(p)
+                           and purpose in p["capabilities"]), None)
+        if chosen is None:
+            chosen = next((p for p in provs if p["enabled"] and _usable(p)), None)
         if chosen is None:
             chosen = next((p for p in provs if p["enabled"]), None) or (provs[0] if provs else None)
 
@@ -573,8 +697,10 @@ def upsert_provider(data: dict, *, pid: str | None = None) -> tuple[bool, str, d
 
         merged = dict(data)
         if target:
+            # preset 必须一起沿用：前端编辑表单不带这个字段，不 setdefault 的话
+            # 保存一次就会把「这条是 DeepSeek 预设」丢掉，分组的依据跟着没了。
             for key in ("name", "kind", "base_url", "models", "enabled",
-                        "capabilities", "params"):
+                        "capabilities", "params", "preset"):
                 merged.setdefault(key, target[key])
         ok_v, err = validate_provider(merged, pid=pid)
         if not ok_v:
@@ -606,6 +732,7 @@ def upsert_provider(data: dict, *, pid: str | None = None) -> tuple[bool, str, d
             "enabled": merged.get("enabled", True),
             "capabilities": merged.get("capabilities"),
             "params": merged.get("params"),
+            "preset": merged.get("preset"),
         })
         if record is None:
             return False, "提供商档案无法解析", None
@@ -626,10 +753,14 @@ def delete_provider(pid: str) -> tuple[bool, str]:
         if used:
             labels = '、'.join(PURPOSE_LABELS.get(p, p) for p in used)
             return False, f"该提供商正被用于「{labels}」，请先改绑到别的提供商再删除"
-        before = len(_providers)
-        _providers[:] = [p for p in _providers if p["id"] != pid]
-        if len(_providers) == before:
+        target = next((p for p in _providers if p["id"] == pid), None)
+        if target is None:
             return False, "提供商不存在"
+        _providers[:] = [p for p in _providers if p["id"] != pid]
+        # 预设厂商删掉就记一笔，否则下次启动 _seed_presets 会把它补回来（删了又活）
+        preset = target.get("preset") or ""
+        if preset:
+            _dismissed.add(preset)
         save_all()
         return True, ""
 
@@ -676,6 +807,9 @@ def delete_provider_force(pid: str) -> tuple[bool, str]:
         for purpose in list(_bindings):
             if _bindings[purpose].get("provider_id") == pid:
                 del _bindings[purpose]
+        target = next((p for p in _providers if p["id"] == pid), None)
+        if target and target.get("preset"):
+            _dismissed.add(target["preset"])
         _providers[:] = [p for p in _providers if p["id"] != pid]
         save_all()
         return True, ""
@@ -778,11 +912,17 @@ def _ollama_options(params: dict) -> dict:
 
 
 def complete(prompt: str, system: str = "", *, purpose: str = "chat",
-             timeout: float = 60.0, model: str | None = None) -> tuple[str, str]:
+             timeout: float = 60.0, model: str | None = None,
+             max_tokens: int | None = None) -> tuple[str, str]:
     """按用途发一次补全，返回 (文本, 错误信息)。
 
     这是所有链路的统一出口：ollama 走 /api/generate，openai 兼容走
     /v1/chat/completions。调用方只管拿到字符串，不必知道背后是哪家。
+
+    max_tokens：覆盖该用途绑定的 num_predict。用途绑定的那个值对**对话**是合适的
+    （默认 600），但产出代码的链路会被它截断 —— 起草插件要吐 manifest + 一整个
+    Python 模块，600 token 说不到一半就断在半句上，表现是「找不到 python 块」，
+    看起来像模型不听话，其实是预算不够。调用方知道自己要多少就自己传。
     """
     r = resolve(purpose)
     kind = r["kind"]
@@ -804,7 +944,7 @@ def complete(prompt: str, system: str = "", *, purpose: str = "chat",
             "model": mdl,
             "messages": messages,
             "temperature": float(params.get("temperature") or 0.7),
-            "max_tokens": int(params.get("num_predict") or 600),
+            "max_tokens": int(max_tokens or params.get("num_predict") or 600),
             "stream": False,
         }
         if params.get("top_p") is not None:
@@ -820,12 +960,15 @@ def complete(prompt: str, system: str = "", *, purpose: str = "chat",
             return "", f"响应格式不符预期：{str(data)[:200]}"
 
     # ollama
+    opts = _ollama_options(params)
+    if max_tokens:
+        opts["num_predict"] = int(max_tokens)
     payload = {
         "model": mdl,
         "prompt": prompt,
         "stream": False,
         "temperature": float(params.get("temperature") or 0.7),
-        "options": _ollama_options(params),
+        "options": opts,
     }
     if sys_text:
         payload["system"] = sys_text

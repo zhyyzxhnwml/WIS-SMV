@@ -40,6 +40,51 @@ HIGH_CONFIDENCE_THRESHOLD = 0.90  # 高置信度阈值（≥0.90 可不走 LLM�
 MEDIUM_CONFIDENCE_THRESHOLD = 0.70  # 中置信度阈值（≥0.70 需相似检索）
 LOW_CONFIDENCE_THRESHOLD = 0.50  # 低置信度阈值（<0.50 需全面审查）
 
+# ── LLM 门控：按"非正常三类的最大概率"而不是 ml_confidence ──────────────
+#
+# 【为什么不用 ml_confidence】
+#   ml_confidence 是**最大类概率**，它回答的是"模型对自己这个判断有多确信"，
+#   不是"这条船有多可能出事"。在 HawaiiCoast_GT（4186 船-日 / 48 起事故）上实测：
+#       · -ml_confidence 与"这条船真出没出事故" **反相关**：AUC 0.404（低于随机）
+#       · max(p_has_risk, p_obvious_issue, p_needs_review)：AUC 0.592，正相关
+#   按前者挑船 = 专门挑错船。旧模型（合成数据训练的 triage_model.txt）把这个
+#   毛病放大了：84% 的船给出 0.997 置信度、has_risk 一次都没输出过，
+#   3777/4186 全塞进 obvious_issue，于是门控等于随机。
+#
+# 【为什么是"最大"而不是"求和"】
+#   三类概率和 p_sum 在实测里高度饱和（p50=p95=0.999），排序靠并列、
+#   结果随并列打破方式抖动；取最大值 pmax 有 2354 个不同取值，排序是确定的。
+#
+# 【阈值怎么定】
+#   按 **LLM 预算不变** 标定：让本规则在全量数据上的调用率与改动前持平，
+#   于是"同样花这些 LLM 调用，捞到多少真事故"才是可比的。
+#   同预算下实测：宽区间召回 18.8%→31.2%（lift 1.13→1.88），
+#   精确锚点 7.7%→38.5%（lift 0.46→2.32）。
+NON_NORMAL_LABELS = ("has_risk", "obvious_issue", "needs_review")
+
+# 非正常三类最大概率 ≥ 此值才送 LLM。
+#
+# 【2026-10 重标定：0.985 → 0.000880】
+#   0.985 是给**旧模型**定的：那个模型（合成数据训练）在真数据上 100/107 条判
+#   obvious_issue、风险分挤在 0.995~0.997（107 条里只有 27 个不同取值），
+#   任何阈值都约等于"全放行"——接线实测只跳过 15.9%，而且跳过的恰好是它认为
+#   最正常的那批。现役 triage_model.txt 已换成用真值重训 + 23 维窗口特征的模型，
+#   分数分布完全变了：p50=0.0001 / p90=0.00088 / max=0.9943（135 个不同取值）。
+#
+#   新阈值的依据分两段，各取所需（见 data/logs/pick_gate.py）：
+#     ① 调用率选 10% —— 用**留一天 OOF** 分数画曲线（`diag_gate_ci.py`），
+#        因为模型在真值上训过，同一批船的分数是记忆，据此选阈值等于挑它记住了哪几天。
+#        10% 那一档：宽区间 lift 3.34 [2.26, 4.45]、精确区间 lift 3.05 [1.33, 4.91]
+#        （按天自助 2000 次）。两个真值口径都站得住，召回 33%/30%，
+#        LLM 调用量只有现役（92.6% 报警率）的 1/9。
+#        2% 档 lift 6.05 但自助区间 [2.72, 9.63]，精确区间口径下区间含 0 —— 小样本极值，不取。
+#     ② 阈值数值 = 部署模型风险分分布上的 1-10% 分位 = 0.000880（实测调用率 10.0%）。
+#        这一步只用部署模型：它要回答的只是"这条分数线上有多少船"，与泛化无关。
+#
+#   ⚠ 换模型必须重标定：阈值是**分数分布**的分位，不是绝对质量。重训后跑
+#     `python data/logs/pick_gate.py`（它按目标调用率反算阈值）。
+RISK_GATE_THRESHOLD = 0.000880
+
 
 @dataclass
 class RoutingDecision:
@@ -50,6 +95,7 @@ class RoutingDecision:
 
     ml_category: str = ""  # ML 预测类别
     ml_confidence: float = 0.0  # ML 预测置信度
+    risk_score: float = 0.0  # 非正常三类的最大概率（LLM 门控用的就是这个）
 
     routing: str = ""  # 路由决策：direct_pass / fast_confirm / careful_review / needs_review
     needs_pgvector: bool = False  # 是否需要 pgvector 相似检索
@@ -91,12 +137,21 @@ class RoutingDecision:
         return templates.get(self.ml_category, "needs_review")  # 默认使用全面审查模板
 
     def to_dict(self) -> dict:
-        """转为字典（便于序列化）。"""
+        """转为字典（便于序列化）。
+
+        `risk_score` 与 `all_probs` 必须在这里，不能只在 dataclass 上：LLM 那条路
+        拿的是 **本方法的返回值**（orchestrator `routing_dict = routing_decision.to_dict()`
+        → `LLMHandler.analyze(routing=...)`）。原先这两项不在返回值里，于是
+        L3 从来不知道 L2 的风险分有多少、自己为什么被门控叫来 —— 只能从轨迹
+        形状猜，而那是最弱的一条线索。落库/前端也多一份可核对的决策依据。
+        """
         return {  # 返回所有字段的字典表示
             "case_id": self.case_id,  # 案例 ID
             "mmsi": self.mmsi,  # MMSI 号
             "ml_category": self.ml_category,  # ML 预测类别
             "ml_confidence": self.ml_confidence,  # ML 置信度
+            "risk_score": self.risk_score,  # 非正常三类的最大概率（门控依据）
+            "all_probs": dict(self.all_probs),  # 四类完整概率分布
             "routing": self.routing,  # 路由决策
             "needs_pgvector": self.needs_pgvector,  # 是否需要 pgvector
             "needs_milvus": self.needs_milvus,  # 是否需要 Milvus
@@ -133,6 +188,7 @@ class TriageRouter:
         feature_vector: list[float],  # 64 维特征向量
         case_id: str = "",  # 案例 ID（可选）
         mmsi: str = "",  # MMSI 号（可选）
+        n_events: Optional[int] = None,  # L1 报出的候选事件条数（见下方门控说明）
     ) -> RoutingDecision:
         """核心路由方法：输入 64 维特征，输出路由决策。
 
@@ -168,6 +224,10 @@ class TriageRouter:
         decision.ml_category = category  # 赋值预测类别
         decision.ml_confidence = confidence  # 赋值预测置信度
         decision.all_probs = all_probs if all_probs else {}
+        # 风险分：非正常三类的最大概率。见文件头 RISK_GATE_THRESHOLD 的实测依据。
+        _probs = decision.all_probs
+        decision.risk_score = max(
+            (float(_probs.get(k, 0.0) or 0.0) for k in NON_NORMAL_LABELS), default=0.0)
 
         # == 第 2 步：路由决策逻辑 ==
         if confidence >= HIGH_CONFIDENCE_THRESHOLD:  # 高置信度（≥0.90）
@@ -221,6 +281,26 @@ class TriageRouter:
             decision.needs_pgvector = True  # 需要全部检索
             decision.needs_milvus = True
             decision.needs_llm = True
+
+        # == 第 2b 步：LLM 门控覆盖上面按置信度的阶梯判定 ==
+        # 阶梯仍然决定 routing 标签与是否需要相似检索（下游语义不变），
+        # 但"要不要花 LLM"这个决定由这里出。
+        #
+        # 【判据一（优先）：L1 的证据强度】调用方给了 n_events 就用它。
+        #   实测（注入集 240 船，零额外 LLM 成本，见 experiments/paper/gate_design.py）：
+        #                完整规则      摘掉让路规则   摘掉追越规则
+        #   风险分判据   64.3%@240调   64.3%@240     64.3%@240
+        #   证据强度判据 **100%@65调**  **67.4%@78**  **79.4%@106**
+        #   三个场景**全部**同时赢成本与质量。理由：门控真正该问的是
+        #   "规则层对这条船有没有把握"，而 risk_score 学的是"这条轨迹有多少个点"。
+        #   规则一条候选事件都没报 → 那正是 L1 的能力边界（规则盲区），
+        #   此时才值得让 LLM 看第二眼；报了事件说明规则已经看过并给出了判断。
+        #
+        # 【判据二（回退）：风险分】调用方没给 n_events 时保持原行为，兼容旧调用。
+        if n_events is not None:
+            decision.needs_llm = int(n_events) == 0
+        else:
+            decision.needs_llm = decision.risk_score >= RISK_GATE_THRESHOLD
 
         # == 第 3 步：按需执行向量检索 ==
         if decision.needs_pgvector and self.pgvector_client:  # 需要 pgvector 且客户端可用

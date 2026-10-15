@@ -262,7 +262,7 @@
 
 ### `GET /ai/tools`
 
-智能体工具目录（9 个内置技能 + 当前用户自定义技能）。新增 `violation_evidence`（违规证据链，Lv4）：按 MMSI 查单船违规判定的完整依据——① 轨迹分析 ② 规则匹配 ③ 法规引用 ④ LLM 复核，回答"这艘船怎么违规的、对应法规第几条"。
+智能体工具目录（内置技能 + 已启用的可执行插件）。新增 `violation_evidence`（违规证据链，Lv4）：按 MMSI 查单船违规判定的完整依据——① 轨迹分析 ② 规则匹配 ③ 法规引用 ④ LLM 复核，回答"这艘船怎么违规的、对应法规第几条"。
 
 ### `GET /ai/query/ship` / `GET /ai/query/violation-stats` / `GET /ai/query/zone-status`
 
@@ -304,16 +304,24 @@ AI 生成 Logo（返回 SVG data URI）。
 
 恢复 LLM 默认配置。
 
-### 自定义技能 CRUD `dev/skills`
+### 模型提供商 `dev/providers`
+
+厂商目录（DeepSeek / 智谱 / 通义 / 千帆 / 火山方舟…共 21 家）在应用启动时**全部**补进档案，
+所以 `GET /dev/providers` 一次就返回全部厂商，页面上直接平铺展示、就地填密钥即可 ——
+**没有「先添加提供商才看得到」这一步**。补进来的厂商一律 `enabled=false`，避免被
+「按能力自动回落」选中而报「未配置密钥」；用户删掉的厂商会记进 `dismissed_presets` 墓碑，
+下次启动不再补回。
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/dev/skills/template` | GET | 技能模板（skill.md 格式） |
-| `/dev/skills/validate` | POST | 校验技能 md（name/触发词/正文等） |
-| `/dev/skills` | GET/POST | 技能列表 / 新建 |
-| `/dev/skills/<int:sid>` | GET/PUT/DELETE | 详情 / 更新 / 删除 |
+| `/dev/providers` | GET | 提供商列表（脱敏）+ 用途绑定 + 可选类型 |
+| `/dev/providers` | POST | 新建（留给目录里没有的自定义地址，需 `model.config`） |
+| `/dev/providers/<pid>` | PUT/DELETE | 修改 / 删除 |
+| `/dev/providers/<pid>/models` | GET | 拉取该提供商的模型列表 |
+| `/dev/providers/<pid>/test` | POST | 连通性测试 |
+| `/dev/bindings` | GET/PUT | 三种用途（chat/judge/draft）的显式绑定 |
 
-> 技能按登录用户隔离（`custom_skills` 表）；`shipclaw/skills.py` 的 `validate_custom_skill_md()` 校验 name 为小写英文且不冲突内置、label/description 必填、min_level 1~10、触发词非空、正文非空。
+> 密钥 Fernet 加密入库；`api_key` 字段三种语义：**缺席**＝保持原密钥、**空串**＝清除、**非空**＝覆盖。
 
 ---
 

@@ -72,6 +72,51 @@ def ok(data):
     return jsonify({"code": 200, "data": data})
 
 
+# risk_level 这一列全链路用 {high, mid, low}（llm_layer/handler.py、risk_engine.py 的口径），
+# 但同义词不止一个来源：LLM 会吐 "medium"，L1 提升分支历史上写过 "middle"。
+# 不归一会让仪表盘风险饼图把同一档拆成两个扇区（实测出现过 middle=7 与 mid=2 并存）。
+_RISK_ALIAS = {"middle": "mid", "medium": "mid", "m": "mid", "中": "mid"}
+
+
+def norm_risk(v):
+    """把 risk_level 的各种写法归一到 high/mid/low（未知值落到 low，与前端既有行为一致）。"""
+    k = (v or "").strip().lower()
+    k = _RISK_ALIAS.get(k, k)
+    return k if k in ("high", "mid", "low") else "low"
+
+
+# ── 违规类型的唯一读取口径 ──
+# 库里用**两列**表达"这是什么违规"，来历完全不同：
+#   violation_code  —— L1 回填时物化的规范码，唯一可信的键（give_way_failure / ais_gap …）
+#   violation_type  —— 旧链路的原始输出，可能是 AIS002 / AIS-GAP / 'ais off'，也可能是**空串**
+# 各接口若直接读 violation_type，describe() 认不出的键就落到 unknown，显示成「其他违规」。
+# 实测 132 条违规里 90 条的 violation_type 是空的（回填只写了 violation_code），
+# 而 violation_code / violation_label 两列**每一行都有值**——这才是该读的列。
+# 所以聚合与展示一律 _VCODE_SQL 优先、_VRAW_SQL 兜底，标签统一由 _vlabel() 出。
+_VCODE_SQL = "COALESCE(NULLIF(violation_code,''),'')"
+_VRAW_SQL = "COALESCE(NULLIF(violation_type,''),'')"
+_VLABEL_SQL = "COALESCE(NULLIF(violation_label,''),'')"
+
+try:
+    from ais_accelerator.violation_catalog import describe as _describe_code
+except Exception:      # 加速器不可用时退化为原样返回（不吞数据），与各接口既有的 try/except 一致
+    _describe_code = None
+
+
+def _vlabel(code: str, label: str = "", raw: str = "") -> str:
+    """违规类型 → 中文标签。码 > 物化标签 > 原始 violation_type。
+
+    describe() 的键表把规范码、中文标签、以及历史 LLM 输出（AIS002 / AIS-GAP …）
+    都收进去了，所以三者都能喂给它；只有真正认不出的才落到 unknown（「其他违规」）。
+    """
+    key = (code or "").strip() or (label or "").strip() or (raw or "").strip()
+    if not key:
+        return "未分类"
+    if _describe_code is None:
+        return key
+    return _describe_code(key)["label"]
+
+
 # ═══════════════════════════════════════════════════════════
 # Vue 静态文件路由
 # ═══════════════════════════════════════════════════════════
@@ -257,7 +302,7 @@ def perm_required(key):
 
     权限点 → 角色的映射在 permissions.py，三个内置角色固定。现有 9 处
     @role_required 一行不改：它们的可达性与等价权限点一致，权限点只用来
-    表达**新增**的收紧（API 密钥、规则包发布）。
+    表达**新增**的收紧（API 密钥、插件发布）。
 
     拒绝时写一条 denied 审计 —— 「谁试图做什么被挡了」是审计最该有的内容之一，
     而它恰好是业务代码不会主动记录的部分。
@@ -521,6 +566,15 @@ def dashboard_violation_distribution():
         f"SELECT risk_level, COUNT(*) as count FROM detection_results WHERE violation_detected = 1{(' AND ' + scope_sql) if scope_sql else ''} GROUP BY risk_level ORDER BY count DESC",
         scope_params,
     ).fetchall()
+    # 归一风险等级词表后再聚合：不归一会让饼图把同一档拆成两个扇区
+    # （实测出现过 middle=7 与 mid=2 并存）。归一口径见 norm_risk()。
+    _risk_agg: dict[str, int] = {}
+    for _r in risk_rows:
+        _lvl = norm_risk(_r["risk_level"])
+        _risk_agg[_lvl] = _risk_agg.get(_lvl, 0) + _r["count"]
+    # 合并后要重排：SQL 的 ORDER BY count DESC 是按合并前的分组排的，已失效
+    risk_rows = [{"risk_level": _lvl, "count": _n}
+                 for _lvl, _n in sorted(_risk_agg.items(), key=lambda kv: -kv[1])]
     # 违规时间趋势（按日）
     trend_rows = conn.execute(f"""
         SELECT SUBSTR(analysis_time, 1, 10) as day, COUNT(*) as cnt
@@ -535,15 +589,29 @@ def dashboard_violation_distribution():
             "dailyTrend": [{"day": r["day"][5:10], "count": r["cnt"]} for r in trend_rows],
         })
 
+    # 空库兜底：只有一条记录都没有时才走到这里，纯粹是让首屏不是一块白板。
+    # 标签一律从 violation_catalog 现取，不再硬编码中文名 —— 原先写死的
+    # 「航线偏离」「通信违规」并不在 CANONICAL 里，分类目录一改这里就漂。
+    _demo = [
+        ("speed_violation", 15),
+        ("anchoring_out_of_bounds", 10),
+        ("overtaking_violation", 8),
+        ("wrong_way_navigation", 7),
+        ("collision_risk", 6),
+        ("give_way_failure", 5),
+        ("illegal_fishing", 4),
+        ("fairway_anchoring", 3),
+        ("illegal_towing", 3),
+        ("ais_gap", 3),
+        ("ais_off", 2),
+    ]
+    try:
+        from ais_accelerator.violation_catalog import list_catalog
+        _labels = {t["code"]: t["label"] for t in list_catalog().get("types", [])}
+    except Exception:
+        _labels = {}
     return ok({
-        "types": [
-            {"type": "超速", "count": 15},
-            {"type": "越界锚泊", "count": 10},
-            {"type": "违规追越", "count": 8},
-            {"type": "航线偏离", "count": 7},
-            {"type": "违规捕捞", "count": 4},
-            {"type": "通信违规", "count": 3},
-        ],
+        "types": [{"type": _labels.get(_c, _c), "count": _n} for _c, _n in _demo],
         "riskLevels": [
             {"risk_level": "high", "count": 15},
             {"risk_level": "mid", "count": 10},
@@ -569,7 +637,10 @@ def dashboard_alerts():
     conn = get_db()
     scope_sql, scope_params = _user_scope()
     rows = conn.execute(f"""
-        SELECT id, analysis_time as time, mmsi, violation_type,
+        SELECT id, analysis_time as time, mmsi,
+               {_VCODE_SQL} as vcode,
+               {_VLABEL_SQL} as vlabel,
+               {_VRAW_SQL} as raw_type,
                risk_level, avg_speed, max_speed
         FROM detection_results
         WHERE violation_detected = 1{(' AND ' + scope_sql) if scope_sql else ''}
@@ -577,31 +648,26 @@ def dashboard_alerts():
     """, scope_params).fetchall()
     conn.close()
 
-    try:
-        from ais_accelerator.violation_catalog import describe
-        _cat_ok = True
-    except Exception:
-        _cat_ok = False
-
+    # 键就是归一后的词表（norm_risk 的取值域），查表也必须过 norm_risk ——
+    # 原先直接拿库里的原值查，得靠额外塞一个 "middle" 键兜住；
+    # 而 LLM 会吐的 "medium" 没有兜底，会掉到 "info"（风险配色错档）。
+    # 放在循环外：它与 r 无关，原先每行重算一次。
+    tag_map = {"high": "danger", "mid": "warning", "low": "info"}
     alerts = []
     for r in rows:
-        tag_map = {"high": "danger", "mid": "warning", "middle": "warning", "low": "info"}
-        raw_type = r["violation_type"] or ""
-        if _cat_ok:
-            info = describe(raw_type)
-            vtype = info["label"]
-        else:
-            vtype = raw_type or "未分类"
+        # 类型取自 violation_code（回填物化的规范码），不是 violation_type ——
+        # 原先读 violation_type 时，回填只写了码、没写它，20 行里 13 行显示「其他违规」。
+        vtype = _vlabel(r["vcode"], r["vlabel"], r["raw_type"])
         alerts.append({
             "id": r["id"],
             "time": r["time"],
             "shipName": r["mmsi"],
             "mmsi": r["mmsi"],
             "violationType": vtype,
-            "tagType": tag_map.get(r["risk_level"], "info"),
+            "tagType": tag_map.get(norm_risk(r["risk_level"]), "info"),
             "position": {"lat": 29.582, "lng": 106.663},
             # 归一化：兼容旧数据 'middle' → 'mid'
-            "riskLevel": "mid" if (r["risk_level"] or "").lower() == "middle" else (r["risk_level"] or "low"),
+            "riskLevel": norm_risk(r["risk_level"]),
         })
     return ok(alerts)
 
@@ -977,7 +1043,7 @@ def cascade_ship_tracks():
     rows = conn.execute(f"""
         SELECT mmsi, avg_speed, violation_detected, quality_level,
                ml_category, ml_confidence, routing, ml_probabilities,
-               violation_type, violation_label, risk_level, confidence, detailed_result
+               violation_code, violation_type, violation_label, risk_level, confidence, detailed_result
         FROM detection_results{(' WHERE ' + scope_sql) if scope_sql else ''}
     """, scope_params).fetchall()
     conn.close()
@@ -1044,9 +1110,7 @@ def cascade_ship_tracks():
         # L3：LLM 判定
         violated = bool(r["violation_detected"])
         l3_verdict["violated" if violated else "normal"] += 1
-        risk = (r["risk_level"] or "low").lower()
-        if risk == "middle":
-            risk = "mid"
+        risk = norm_risk(r["risk_level"])
         l3_risk_ships[risk] = l3_risk_ships.get(risk, 0) + 1
 
         ships.append({
@@ -1065,7 +1129,7 @@ def cascade_ship_tracks():
             },
             "l3": {
                 "violated": violated,
-                "violationLabel": r["violation_label"] or _elabel(r["violation_type"] or ""),
+                "violationLabel": _vlabel(r["violation_code"], r["violation_label"], r["violation_type"]),
                 "riskLevel": risk,
                 "confidence": float(r["confidence"] or 0),
             },
@@ -1352,7 +1416,10 @@ def violations_list():
     """, params + [page_size, (page - 1) * page_size]).fetchall()
     conn.close()
 
-    tag_map = {"high": "danger", "mid": "warning", "middle": "warning", "low": "info"}
+    # 键就是归一后的词表（norm_risk 的取值域），查表也必须过 norm_risk ——
+    # 原先直接拿库里的原值查，得靠额外塞一个 "middle" 键兜住；
+    # 而 LLM 会吐的 "medium" 没有兜底，会掉到 "info"（风险配色错档）。
+    tag_map = {"high": "danger", "mid": "warning", "low": "info"}
     vlist = []
     for r in rows:
         raw_type = r["violation_type"] or ""
@@ -1394,9 +1461,9 @@ def violations_list():
             "subtypeLabel": sub_label,       # 如 "疑似关闭"
             "subtypeUnit": sub_unit,         # 如 "分钟"
             "metric": r["violation_metric"] or 0,   # 定档依据的实测量值
-            "tagType": tag_map.get(r["risk_level"], "info"),
+            "tagType": tag_map.get(norm_risk(r["risk_level"]), "info"),
             # 归一化风险等级：兼容旧数据 'middle' → 'mid'，确保前端标签一致
-            "riskLevel": "mid" if (r["risk_level"] or "").lower() == "middle" else (r["risk_level"] or "low"),
+            "riskLevel": norm_risk(r["risk_level"]),
             "description": event or r["violation_desc"],   # 可读违规事件
             "regulationRef": reg_ref,
             # 只放处置枚举（翻译后），不回退到正文 —— 正文已经在 description 里了
@@ -1422,8 +1489,7 @@ def violation_detail(vid):
 
     data = dict(r)
     # 归一化风险等级
-    rl = (data.get("risk_level") or "").lower()
-    data["risk_level"] = "mid" if rl == "middle" else (data.get("risk_level") or "low")
+    data["risk_level"] = norm_risk(data.get("risk_level"))
     # 从 detailed_result 提取风险评分明细（供前端"为什么是这个等级"展示）
     try:
         import json as _json
@@ -1556,7 +1622,8 @@ def violations_evidence_stats():
     conn = get_db()
     scope_sql, scope_params = _user_scope()
     rows = conn.execute(f"""
-        SELECT id, mmsi, violation_type, regulation_ref, detailed_result
+        SELECT id, mmsi, {_VCODE_SQL} as vcode, {_VRAW_SQL} as raw_type,
+               regulation_ref, detailed_result
         FROM detection_results
         WHERE violation_detected = 1{(' AND ' + scope_sql) if scope_sql else ''}
     """, scope_params).fetchall()
@@ -1566,7 +1633,7 @@ def violations_evidence_stats():
 
     stats: dict[str, dict] = {}
     for r in rows:
-        code = normalize_violation_code(r["violation_type"] or "")
+        code = normalize_violation_code(r["vcode"] or r["raw_type"] or "")
         if code not in stats:
             stats[code] = {
                 "code": code, "label": describe(code)["label"],
@@ -1700,33 +1767,40 @@ def _query_data_for_message(message: str) -> str:
     scope_sql, scope_params = _user_scope()
     and_scope = f" AND {scope_sql}" if scope_sql else ""
 
-    # 违规类型 → 中文标签
-    try:
-        from ais_accelerator.violation_catalog import describe as _d
-        def _vl(t):
-            return _d(t or "")["label"]
-    except Exception:
-        def _vl(t):
-            return t or ""
+    # 违规类型 → 中文标签（与全站同一口径：规范码优先，见 _vlabel）
+    _vl = _vlabel
 
     # 违规种类/类型
     if any(kw in msg for kw in ["种类", "类型", "分类", "哪些违规"]):
         conn = get_db()
-        rows = conn.execute(f"SELECT violation_type, COUNT(*) as c FROM detection_results WHERE violation_detected=1{and_scope} GROUP BY violation_type ORDER BY c DESC", scope_params).fetchall()
+        rows = conn.execute(
+            f"SELECT {_VCODE_SQL} as vcode, {_VRAW_SQL} as raw_type, COUNT(*) as c "
+            f"FROM detection_results WHERE violation_detected=1{and_scope} "
+            f"GROUP BY vcode, raw_type ORDER BY c DESC", scope_params).fetchall()
         conn.close()
         if rows:
-            parts.append("系统违规类型数据：" + ", ".join(f"{_vl(r['violation_type'])}({r['c']}起)" for r in rows))
+            parts.append("系统违规类型数据：" + ", ".join(f"{_vl(r['vcode'], '', r['raw_type'])}({r['c']}起)" for r in rows))
 
     # 规律/趋势/分析
     if any(kw in msg for kw in ["规律", "趋势", "分析", "特点", "模式"]):
         conn = get_db()
-        by_type = conn.execute(f"SELECT violation_type, COUNT(*) as c FROM detection_results WHERE violation_detected=1{and_scope} GROUP BY violation_type", scope_params).fetchall()
+        by_type = conn.execute(
+            f"SELECT {_VCODE_SQL} as vcode, {_VRAW_SQL} as raw_type, COUNT(*) as c "
+            f"FROM detection_results WHERE violation_detected=1{and_scope} "
+            f"GROUP BY vcode, raw_type", scope_params).fetchall()
         by_risk = conn.execute(f"SELECT risk_level, COUNT(*) as c FROM detection_results WHERE violation_detected=1{and_scope} GROUP BY risk_level", scope_params).fetchall()
         recid = conn.execute(f"SELECT mmsi, COUNT(*) as c FROM detection_results WHERE violation_detected=1{and_scope} GROUP BY mmsi HAVING COUNT(*) > 1 ORDER BY c DESC LIMIT 3", scope_params).fetchall()
         conn.close()
-        total = sum(r["c"] for r in by_type) if by_type else 0
+        # 按标签再合并一次：同一个规范码可能带着几种原始 violation_type 各成一组，
+        # 不合并就会把「AIS信号缺失」拆成好几项报给 LLM。
+        _agg: dict[str, int] = {}
+        for r in by_type:
+            lb = _vl(r["vcode"], "", r["raw_type"])
+            _agg[lb] = _agg.get(lb, 0) + r["c"]
+        by_type = sorted(_agg.items(), key=lambda kv: -kv[1])
+        total = sum(n for _, n in by_type)
         if by_type:
-            parts.append("违规分布：" + ", ".join(f"{_vl(r['violation_type'])} {r['c']}起({r['c']/max(total,1)*100:.0f}%)" for r in by_type))
+            parts.append("违规分布：" + ", ".join(f"{lb} {n}起({n/max(total,1)*100:.0f}%)" for lb, n in by_type))
         if by_risk:
             parts.append("风险分布：" + ", ".join(f"{r['risk_level']} {r['c']}起" for r in by_risk))
         if recid:
@@ -1742,10 +1816,14 @@ def _query_data_for_message(message: str) -> str:
     # 最近/最新
     if any(kw in msg for kw in ["最近", "最新", "今天"]):
         conn = get_db()
-        rows = conn.execute(f"SELECT mmsi, violation_type, analysis_time FROM detection_results WHERE violation_detected=1{and_scope} ORDER BY analysis_time DESC LIMIT 5", scope_params).fetchall()
+        rows = conn.execute(
+            f"SELECT mmsi, {_VCODE_SQL} as vcode, {_VLABEL_SQL} as vlabel, {_VRAW_SQL} as raw_type, analysis_time "
+            f"FROM detection_results WHERE violation_detected=1{and_scope} "
+            f"ORDER BY analysis_time DESC LIMIT 5", scope_params).fetchall()
         conn.close()
         if rows:
-            parts.append("最近违规：" + "; ".join(f"{r['mmsi']} {_vl(r['violation_type'])} {r['analysis_time'][:16]}" for r in rows))
+            parts.append("最近违规：" + "; ".join(
+                f"{r['mmsi']} {_vl(r['vcode'], r['vlabel'], r['raw_type'])} {r['analysis_time'][:16]}" for r in rows))
 
     # 提取MMSI查询船舶
     mmsi_match = re.search(r'(\d{6,})', msg)
@@ -1757,7 +1835,8 @@ def _query_data_for_message(message: str) -> str:
         if ship:
             info = f"船舶{mmsi} 均速{ship['avg_speed']:.1f}kn 最高{ship['max_speed']:.1f}kn 路由={ship['routing']}"
             if ship["violation_detected"]:
-                info += f" 违规类型={ship['violation_type']} 风险={ship['risk_level']}"
+                _vt = _vl(ship["violation_code"], ship["violation_label"], ship["violation_type"])
+                info += f" 违规类型={_vt} 风险={ship['risk_level']}"
             parts.append(info)
 
     # 默认带上总体概况
@@ -1822,6 +1901,9 @@ def ai_chat():
                 "personality": result.get("personality"),
                 "structured": result.get("structured"),
                 "blocks": result.get("blocks"),   # 渲染型工具产出（chart/table/doc），无则为 None
+                # AI 造插件成功时的草稿信息（其余对话为 None）。前端据此渲染
+                # 「查看草稿」按钮，跳到 开发者 → 插件。
+                "forge": result.get("forge"),
             })
         except Exception as e:
             # ShipClaw 失败，降级到简单 Ollama 调用
@@ -1847,22 +1929,28 @@ def ai_chat():
 @app.route("/api/v1/ai/tools")
 @login_required
 def ai_tools():
-    """返回智能体可用工具目录（内置 + 该用户自定义技能），供前端展示。"""
+    """返回智能体可用工具目录（内置 + 全局已启用插件）。
+
+    【这份目录是「给人看 + 给 LLM 看」的清单，不等于执行权】
+      真正决定「用不用某个工具」的是 shipclaw/skills.py 的 match_best_skill()
+      —— 确定性关键词打分。把工具列在这里不会让它被调用，只是让用户知道有什么。
+      （本仓没有 function-calling 循环，不存在「LLM 看到目录就自己调」这回事。）
+    """
     try:
-        from shipclaw.skills import get_tool_catalog, load_user_custom_skills
+        from shipclaw.skills import get_tool_catalog, load_enabled_plugins
         catalog = get_tool_catalog()
-        uid = _current_uid()
-        if uid:
-            for cs in load_user_custom_skills(uid):
-                catalog.append({
-                    "name": cs.name,
-                    "label": cs.label,
-                    "description": cs.description,
-                    "icon": cs.icon,
-                    "params": [],
-                    "min_level": cs.min_level,
-                    "custom": True,
-                })
+        # 插件是全局的，不按用户过滤（作用域就是 global）
+        for pt in load_enabled_plugins():
+            catalog.append({
+                "name": pt.name,
+                "label": pt.label,
+                "description": pt.description,
+                "icon": pt.icon,
+                "params": [],
+                "min_level": pt.min_level,
+                "kind": "plugin",
+                "trigger_keywords": pt.trigger_keywords,
+            })
         return ok(catalog)
     except Exception as e:
         _logger_err = logging.getLogger("app.ai")
@@ -1984,21 +2072,16 @@ def dev_list_providers():
     })
 
 
-@app.route("/api/v1/dev/provider-presets")
-@login_required
-def dev_provider_presets():
-    """预设提供商目录（只读）。
-
-    对全部登录用户开放：这里没有任何密钥，只是「DeepSeek 的地址长这样」这类公开信息。
-    真正加提供商仍要 model.config —— 因为那一步要填密钥。
-    """
-    return ok({"groups": llm_presets.list_groups()})
-
-
 @app.route("/api/v1/dev/providers", methods=["POST"])
 @perm_required("model.config")
 def dev_create_provider():
-    """新建提供商。载荷可以只给 {preset, api_key}，其余字段由预设补齐。"""
+    """新建提供商。
+
+    正常路径下用户**不需要**走这里：厂商目录（llm_presets）在启动时就已全部补进
+    档案，页面上一眼能看到所有厂商，就地填密钥即可。这个接口留给目录里没有的
+    自定义地址（kind=openai_compat 的任意兼容端点）。载荷仍可只给 {preset, api_key}，
+    其余字段由预设补齐。
+    """
     data, err_p = llm_presets.apply_preset(request.get_json() or {})
     if err_p:
         return jsonify({"code": 400, "message": err_p}), 400
@@ -2114,147 +2197,522 @@ def dev_put_bindings():
     return jsonify({"code": 200, "message": "已保存", "data": after})
 
 
-# ── 开发者模式：自定义技能（用户提交 skill.md，智能体直接可用） ──
-# 每个用户只管理/使用自己的技能；skill 为纯 LLM 驱动（不执行代码）
+# ═══════════════════════════════════════════════════════════
+# 可执行插件（dsh 风格，manifest + Python 判定代码）
+# ═══════════════════════════════════════════════════════════
+#
+# 权限分两层：plugin.draft（所有角色）写草稿、试跑；plugin.publish（仅超管）
+# 启用。草稿永远不参与线上判定，启用才影响所有人的判定。
+#
+# 【SQL 为什么都走 plugin_runtime.store】
+#   同一份读路径有三个调用方（本页、判定链 registry、对话技能池 skills），
+#   各写一份 SELECT 迟早漂移成「网页上看得到、判定链看不到」。
 
-@app.route("/api/v1/dev/skills/template")
-@login_required
-def dev_skills_template():
-    """返回自定义 skill.md 模板。"""
-    from shipclaw.skills import CUSTOM_SKILL_TEMPLATE
-    return ok({"template": CUSTOM_SKILL_TEMPLATE})
-
-
-@app.route("/api/v1/dev/skills/validate", methods=["POST"])
-@login_required
-def dev_skills_validate():
-    """校验 skill.md（不保存），返回解析结果或错误信息。"""
-    from shipclaw.skills import validate_custom_skill_md
-    data = request.get_json(silent=True) or {}
-    md_text = (data.get("skill_md") or "").strip()
-    if not md_text:
-        return jsonify({"code": 400, "message": "请输入 skill.md 内容"}), 400
-    try:
-        p = validate_custom_skill_md(md_text)
-    except ValueError as e:
-        return jsonify({"code": 400, "message": str(e)}), 400
-    return ok({
-        "name": p["name"], "label": p["label"], "icon": p["icon"],
-        "description": p["description"], "min_level": p["min_level"],
-        "trigger_keywords": p["trigger_keywords"],
-    })
+def _plugin_is_super() -> bool:
+    """超管判定。is_super 用来决定列表可见范围（超管看全部，其他人看自己的+系统+已启用）。"""
+    u = current_user() or {}
+    return u.get("role") == "超级管理员"
 
 
-@app.route("/api/v1/dev/skills")
-@login_required
-def dev_skills_list():
-    """列出当前用户的自定义技能。"""
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT id, name, label, icon, description, min_level, trigger_keywords, status, created_at, updated_at "
-        "FROM custom_skills WHERE user_id = ? ORDER BY id DESC",
-        (_current_uid(),),
-    ).fetchall()
-    conn.close()
-    return ok([dict(r) for r in rows])
+def _plugin_actor() -> tuple[str, str]:
+    u = current_user() or {}
+    return u.get("id", ""), u.get("username", "")
 
 
-@app.route("/api/v1/dev/skills", methods=["POST"])
-@login_required
-def dev_skills_create():
-    """创建自定义技能。"""
-    from shipclaw.skills import validate_custom_skill_md
-    data = request.get_json(silent=True) or {}
-    md_text = (data.get("skill_md") or "").strip()
-    try:
-        p = validate_custom_skill_md(md_text)
-    except ValueError as e:
-        return jsonify({"code": 400, "message": str(e)}), 400
-    conn = get_db()
-    uid = _current_uid()
-    dup = conn.execute(
-        "SELECT 1 FROM custom_skills WHERE user_id = ? AND name = ?", (uid, p["name"])
-    ).fetchone()
-    if dup:
-        conn.close()
-        return jsonify({"code": 400, "message": f"技能名 {p['name']} 已存在，请直接编辑或换名"}), 400
-    row = conn.execute(
-        "INSERT INTO custom_skills (user_id, name, label, icon, description, min_level, trigger_keywords, manual_md, status) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active') RETURNING id",
-        (uid, p["name"], p["label"], p["icon"], p["description"], p["min_level"],
-         ",".join(p["trigger_keywords"]), p["manual_md"]),
-    ).fetchone()
-    conn.commit()
-    conn.close()
-    return ok({"id": row["id"] if row else None, "name": p["name"], "label": p["label"]})
-
-
-@app.route("/api/v1/dev/skills/<int:sid>")
-@login_required
-def dev_skills_get(sid):
-    """获取单个自定义技能（含完整 skill.md，供编辑回填）。"""
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM custom_skills WHERE id = ? AND user_id = ?", (sid, _current_uid())
-    ).fetchone()
-    conn.close()
+def _plugin_or_404(conn, pid):
+    from plugin_runtime import store
+    row = store.get_plugin(conn, pid)
     if not row:
-        return jsonify({"code": 404, "message": "技能不存在"}), 404
-    return ok(dict(row))
+        return None, (jsonify({"code": 404, "message": "插件不存在"}), 404)
+    return row, None
 
 
-@app.route("/api/v1/dev/skills/<int:sid>", methods=["PUT"])
+def _can_see_plugin(row) -> bool:
+    """非超管只能看：系统预置 / 已启用 / 自己起草的。与 store.list_plugins 的 SQL 同口径。"""
+    if _plugin_is_super():
+        return True
+    uid = _current_uid() or ""
+    return (row.get("status") == "enabled" or row.get("origin") == "system"
+            or row.get("author_user_id") == uid)
+
+
+@app.route("/api/v1/dev/plugins")
 @login_required
-def dev_skills_update(sid):
-    """更新自定义技能内容或状态（status=active/disabled）。"""
-    from shipclaw.skills import validate_custom_skill_md
-    data = request.get_json(silent=True) or {}
-    status = (data.get("status") or "").strip()
-    if status in ("active", "disabled"):
-        conn = get_db()
-        conn.execute(
-            "UPDATE custom_skills SET status = ?, updated_at = to_char(now(),'YYYY-MM-DD HH24:MI:SS') "
-            "WHERE id = ? AND user_id = ?",
-            (status, sid, _current_uid()),
-        )
-        conn.commit()
-        conn.close()
-        return ok({"updated": True, "status": status})
-    md_text = (data.get("skill_md") or "").strip()
+def dev_plugins_list():
+    """列出可见插件。超管看全部，其他人看「自己的 + 系统预置 + 已启用」。"""
+    from plugin_runtime import store
+    conn = get_db()
     try:
-        p = validate_custom_skill_md(md_text)
-    except ValueError as e:
-        return jsonify({"code": 400, "message": str(e)}), 400
-    conn = get_db()
-    uid = _current_uid()
-    dup = conn.execute(
-        "SELECT 1 FROM custom_skills WHERE user_id = ? AND name = ? AND id <> ?",
-        (uid, p["name"], sid),
-    ).fetchone()
-    if dup:
+        rows = store.list_plugins(conn, _current_uid() or "", see_all=_plugin_is_super())
+    finally:
         conn.close()
-        return jsonify({"code": 400, "message": f"技能名 {p['name']} 已被其它技能占用"}), 400
-    conn.execute(
-        "UPDATE custom_skills SET name = ?, label = ?, icon = ?, description = ?, "
-        "min_level = ?, trigger_keywords = ?, manual_md = ?, "
-        "updated_at = to_char(now(),'YYYY-MM-DD HH24:MI:SS') WHERE id = ? AND user_id = ?",
-        (p["name"], p["label"], p["icon"], p["description"], p["min_level"],
-         ",".join(p["trigger_keywords"]), p["manual_md"], sid, uid),
-    )
-    conn.commit()
-    conn.close()
-    return ok({"updated": True})
+    return ok(rows)
 
 
-@app.route("/api/v1/dev/skills/<int:sid>", methods=["DELETE"])
+@app.route("/api/v1/dev/plugins/template")
 @login_required
-def dev_skills_delete(sid):
-    """删除自定义技能。"""
+def dev_plugins_template():
+    """返回一份可直接跑的插件模板（预置插件原文，比任何说明都清楚）。"""
+    try:
+        text = (ROOT_DIR / "plugins" / "fishing_zone_judge" / "plugin.py").read_text(
+            encoding="utf-8")
+    except Exception:
+        text = ("---\nname: my_plugin\nlabel: 我的判定插件\nicon: 🧩\n"
+                "description: 一句话说明判什么\nspec: v1\nhooks: adjudicate\n"
+                "trust: sandbox\ntimeout_ms: 1200\nmax_findings: 5\n"
+                "can_raise_risk: false\ntrigger_keywords: 关键词\n---\n"
+                "PLUGIN = {\"name\": \"my_plugin\", \"entry_tool\": \"adjudicate\"}\n\n\n"
+                "def apply(ctx):\n"
+                "    ctx.tools.register(name=\"adjudicate\", handler=_judge)\n\n\n"
+                "def _judge(facts):\n    return []\n")
+    return ok({"template": text})
+
+
+@app.route("/api/v1/dev/plugins/<int:pid>")
+@login_required
+def dev_plugins_get(pid):
+    """取单个插件（含当前版本的 manifest 与源码，供编辑回填）。
+
+    可见性检查在这里做，不在路由上挂角色 —— 普通用户能看自己起草的草稿，
+    这正是「让 AI 帮我造插件」的体验所必需的。
+    """
+    from plugin_runtime import store
     conn = get_db()
-    conn.execute("DELETE FROM custom_skills WHERE id = ? AND user_id = ?", (sid, _current_uid()))
-    conn.commit()
-    conn.close()
+    try:
+        row, err = _plugin_or_404(conn, pid)
+        if err:
+            return err
+        if not _can_see_plugin(row):
+            return jsonify({"code": 404, "message": "插件不存在"}), 404
+        ver = store.get_version(conn, pid, row["current_version"]) or {}
+    finally:
+        conn.close()
+    row = dict(row)
+    row["manifest_yaml"] = ver.get("manifest_yaml", "")
+    row["source_py"] = ver.get("source_py", "")
+    row["source_sha256"] = ver.get("source_sha256", "")
+    row["validation_report"] = ver.get("validation_report", "{}")
+    row["version_count"] = None       # 由 /versions 提供，这里不额外查一次
+    return ok(row)
+
+
+@app.route("/api/v1/dev/plugins/<int:pid>/versions")
+@login_required
+def dev_plugins_versions(pid):
+    """版本历史（不含源码正文，列表用不上；点某一版再单独取）。"""
+    from plugin_runtime import store
+    conn = get_db()
+    try:
+        row, err = _plugin_or_404(conn, pid)
+        if err:
+            return err
+        if not _can_see_plugin(row):
+            return jsonify({"code": 404, "message": "插件不存在"}), 404
+        return ok(store.list_versions(conn, pid))
+    finally:
+        conn.close()
+
+
+@app.route("/api/v1/dev/plugins/<int:pid>/findings")
+@login_required
+def dev_plugins_findings(pid):
+    """该插件的运行记录。**包含 result<>'ok' 的失败行** —— 那是排障入口。
+
+    页面上把失败行单独标出来，不要和正常判定混在一起看：
+    一行 result='timeout' 说明插件在超时，跟「这条船判出了什么」是两件事。
+    """
+    from plugin_runtime import store
+    limit = request.args.get("limit", type=int) or 50
+    conn = get_db()
+    try:
+        row, err = _plugin_or_404(conn, pid)
+        if err:
+            return err
+        if not _can_see_plugin(row):
+            return jsonify({"code": 404, "message": "插件不存在"}), 404
+        rows = store.list_findings(conn, pid, limit)
+    finally:
+        conn.close()
+    for r in rows:
+        try:
+            r["span"] = json.loads(r.get("span_json") or "[]")
+        except (TypeError, ValueError):
+            r["span"] = []
+        try:
+            r["logs"] = json.loads(r.get("logs_json") or "[]")
+        except (TypeError, ValueError):
+            r["logs"] = []
+    return ok(rows)
+
+
+@app.route("/api/v1/dev/plugins/<int:pid>/versions/<int:version>")
+@login_required
+def dev_plugins_version_get(pid, version):
+    """取某一版的全文（回滚前想看看旧版长什么样，或想从旧版复制一段）。"""
+    from plugin_runtime import store
+    conn = get_db()
+    try:
+        row, err = _plugin_or_404(conn, pid)
+        if err:
+            return err
+        if not _can_see_plugin(row):
+            return jsonify({"code": 404, "message": "插件不存在"}), 404
+        ver = store.get_version(conn, pid, version)
+    finally:
+        conn.close()
+    if not ver:
+        return jsonify({"code": 404, "message": "版本不存在"}), 404
+    return ok(dict(ver))
+
+
+@app.route("/api/v1/dev/plugins", methods=["POST"])
+@perm_required("plugin.draft")
+def dev_plugins_create():
+    """新建插件草稿。**只能落成 draft** —— 启用是超管的动作。
+
+    请求体：{name, label, icon, description, plugin_text, trust, can_raise_risk,
+             trigger_keywords}
+    或简化形态：{manifest_yaml, source_py} —— 页面是分两块编辑的，这里拼回全文。
+    """
+    from plugin_runtime import store
+    from plugin_runtime.manifest import parse_plugin_file
+    from plugin_runtime.validate import ValidationError, check_source
+
+    data = request.get_json(silent=True) or {}
+    text = _plugin_text_from_request(data)
+    if not text:
+        return jsonify({"code": 400, "message": "缺少插件内容（plugin_text 或 manifest_yaml + source_py）"}), 400
+
+    try:
+        parsed = parse_plugin_file(text)
+        stats = check_source(parsed["body"], parsed["meta"]["hooks"])
+    except (ValueError, ValidationError) as e:
+        return jsonify({"code": 400, "message": str(e)}), 400
+
+    meta = parsed["meta"]
+    uid, uname = _plugin_actor()
+    conn = get_db()
+    try:
+        if store.get_plugin_by_name(conn, meta["name"]):
+            return jsonify({"code": 400,
+                            "message": f"插件名 {meta['name']} 已存在，请直接编辑它或换名"}), 400
+        pid = store.create_plugin(
+            conn, name=meta["name"], label=meta["label"], icon=meta["icon"],
+            description=meta["description"], origin="manual", trust=meta["trust"],
+            plugin_text=text,
+            source_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            validation_report=json.dumps({"ok": True, **stats}, ensure_ascii=False),
+            author_user_id=uid, author_username=uname,
+            # can_raise_risk 从 manifest 读，但**草稿期一律 False**：
+            # 这项能力只能由超管在启用时另行批准，不能由提交者在文本里自己写 true。
+            can_raise_risk=False,
+            trigger_keywords=",".join(meta["trigger_keywords"]),
+            min_level=meta["min_level"],
+        )
+    finally:
+        conn.close()
+    audit.log("plugin.create", target_type="plugin", target_id=meta["name"],
+              detail={"plugin_id": pid, "name": meta["name"], "origin": "manual",
+                      "validation": stats})
+    return ok({"id": pid, "name": meta["name"], "label": meta["label"],
+               "status": "draft", "validation": stats})
+
+
+@app.route("/api/v1/dev/plugins/<int:pid>", methods=["PUT"])
+@perm_required("plugin.draft")
+def dev_plugins_update(pid):
+    """保存一版新代码。版本只增不改，current_version 指过去。"""
+    from plugin_runtime import store
+    from plugin_runtime.manifest import parse_plugin_file
+    from plugin_runtime.validate import ValidationError, check_source
+
+    data = request.get_json(silent=True) or {}
+    text = _plugin_text_from_request(data)
+    if not text:
+        return jsonify({"code": 400, "message": "缺少插件内容"}), 400
+    try:
+        parsed = parse_plugin_file(text)
+        stats = check_source(parsed["body"], parsed["meta"]["hooks"])
+    except (ValueError, ValidationError) as e:
+        return jsonify({"code": 400, "message": str(e)}), 400
+
+    meta = parsed["meta"]
+    _, uname = _plugin_actor()
+    conn = get_db()
+    try:
+        row, err = _plugin_or_404(conn, pid)
+        if err:
+            return err
+        if not _can_see_plugin(row):
+            return jsonify({"code": 404, "message": "插件不存在"}), 404
+        if meta["name"] != row["name"]:
+            return jsonify({"code": 400,
+                            "message": f"插件名不可改（当前 {row['name']}）—— "
+                                       "改名请新建一个插件"}), 400
+        patch = {k: data[k] for k in ("label", "icon", "description", "trust",
+                                      "trigger_keywords", "min_level")
+                 if k in data}
+        if isinstance(patch.get("trigger_keywords"), list):
+            patch["trigger_keywords"] = ",".join(patch["trigger_keywords"])
+        version = store.add_version(
+            conn, pid, plugin_text=text,
+            source_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            validation_report=json.dumps({"ok": True, **stats}, ensure_ascii=False),
+            author_username=uname, patch=patch)
+    finally:
+        conn.close()
+    audit.log("plugin.update", target_type="plugin", target_id=row["name"],
+              detail={"plugin_id": pid, "version": version, "validation": stats})
+    return ok({"id": pid, "version": version, "validation": stats})
+
+
+@app.route("/api/v1/dev/plugins/<int:pid>/validate", methods=["POST"])
+@perm_required("plugin.draft")
+def dev_plugins_validate(pid):
+    """只校验，不保存。页面上的「校验」按钮走这里。"""
+    from plugin_runtime.manifest import parse_plugin_file
+    from plugin_runtime.validate import ValidationError, check_source
+
+    data = request.get_json(silent=True) or {}
+    text = _plugin_text_from_request(data) or _plugin_current_text(pid)
+    if not text:
+        return jsonify({"code": 400, "message": "缺少插件内容"}), 400
+    try:
+        parsed = parse_plugin_file(text)
+        stats = check_source(parsed["body"], parsed["meta"]["hooks"])
+    except (ValueError, ValidationError) as e:
+        audit.log("plugin.validate", target_type="plugin", target_id=str(pid),
+                  detail={"ok": False, "error": str(e)}, result=audit.RESULT_FAIL)
+        return jsonify({"code": 400, "message": str(e), "data": {"ok": False}}), 400
+    meta = parsed["meta"]
+    audit.log("plugin.validate", target_type="plugin", target_id=meta["name"],
+              detail={"plugin_id": pid, "ok": True, "validation": stats})
+    return ok({"ok": True, "name": meta["name"], "label": meta["label"],
+               "hooks": meta["hooks"], "timeout_ms": meta["timeout_ms"],
+               "max_findings": meta["max_findings"],
+               "trigger_keywords": meta["trigger_keywords"], **stats})
+
+
+@app.route("/api/v1/dev/plugins/<int:pid>/trial", methods=["POST"])
+@perm_required("plugin.draft")
+def dev_plugins_trial(pid):
+    """拿内置样本在子进程里真跑一遍。**不落库、不影响线上**。
+
+    这一步跑的是磁盘上/请求里的代码，不是库里已存的版本 —— 页面上的「试跑」
+    是「我现在写的这版能不能跑」，不是「线上那版跑得怎么样」。
+    """
+    from plugin_runtime.forge import trial
+    data = request.get_json(silent=True) or {}
+    text = _plugin_text_from_request(data) or _plugin_current_text(pid)
+    if not text:
+        return jsonify({"code": 400, "message": "缺少插件内容"}), 400
+    result = trial(text)
+    audit.log("plugin.trial", target_type="plugin", target_id=str(pid),
+              detail={"plugin_id": pid, "ok": result["ok"],
+                      "errors": result["errors"][:5]},
+              result=audit.RESULT_OK if result["ok"] else audit.RESULT_FAIL)
+    return ok(result) if result["ok"] else (
+        jsonify({"code": 400, "message": "试跑未通过：" + "；".join(result["errors"][:3]),
+                 "data": result}), 400)
+
+
+@app.route("/api/v1/dev/plugins/<int:pid>/enable", methods=["POST"])
+@perm_required("plugin.publish")
+def dev_plugins_enable(pid):
+    """启用插件（仅超管）。启用后**全局生效**，影响所有用户的判定批次。"""
+    from plugin_runtime import store
+    from plugin_runtime.sandbox import get_sandbox
+
+    data = request.get_json(silent=True) or {}
+    uid, uname = _plugin_actor()
+    conn = get_db()
+    try:
+        row, err = _plugin_or_404(conn, pid)
+        if err:
+            return err
+        # 启用前必须真跑通一次：库里存的是上一次校验过的文本，但中间可能被
+        # 直接改库/回滚过，启用前再验一遍成本很低，收益是「启用的东西一定能跑」。
+        ver = store.get_version(conn, pid, row["current_version"]) or {}
+        text = ver.get("source_py") or ""
+        if not text:
+            return jsonify({"code": 400, "message": "插件当前版本没有源码，无法启用"}), 400
+        from plugin_runtime.forge import trial
+        tr = trial(text)
+        if not tr["ok"]:
+            return jsonify({"code": 400,
+                            "message": "启用前试跑未通过：" + "；".join(tr["errors"][:3]),
+                            "data": tr}), 400
+        # can_raise_risk 只在这里可以被打开 —— 由超管在启用的同时显式批准。
+        if "can_raise_risk" in data:
+            conn.execute("UPDATE plugins SET can_raise_risk = ? WHERE id = ?",
+                         (bool(data["can_raise_risk"]), pid))
+        store.set_status(conn, pid, "enabled", by=uid or uname)
+        get_sandbox().drop(row["name"])      # 丢弃可能缓存的旧版本 ctx，强制重载
+    finally:
+        conn.close()
+    audit.log("plugin.activate", target_type="plugin", target_id=row["name"],
+              detail={"plugin_id": pid, "version": row["current_version"],
+                      "can_raise_risk": bool(data.get("can_raise_risk")),
+                      "by": uname})
+    return ok({"id": pid, "status": "enabled", "version": row["current_version"]})
+
+
+@app.route("/api/v1/dev/plugins/<int:pid>/disable", methods=["POST"])
+@perm_required("plugin.publish")
+def dev_plugins_disable(pid):
+    """停用插件（仅超管）。"""
+    from plugin_runtime import store
+    from plugin_runtime.sandbox import get_sandbox
+
+    _, uname = _plugin_actor()
+    conn = get_db()
+    try:
+        row, err = _plugin_or_404(conn, pid)
+        if err:
+            return err
+        store.set_status(conn, pid, "disabled")
+        get_sandbox().drop(row["name"])
+    finally:
+        conn.close()
+    audit.log("plugin.disable", target_type="plugin", target_id=row["name"],
+              detail={"plugin_id": pid, "by": uname})
+    return ok({"id": pid, "status": "disabled"})
+
+
+@app.route("/api/v1/dev/plugins/<int:pid>/rollback", methods=["POST"])
+@perm_required("plugin.publish")
+def dev_plugins_rollback(pid):
+    """把 current_version 指回某一版。不删任何版本。"""
+    from plugin_runtime import store
+    from plugin_runtime.sandbox import get_sandbox
+
+    data = request.get_json(silent=True) or {}
+    try:
+        version = int(data.get("version") or 0)
+    except (TypeError, ValueError):
+        version = 0
+    if version <= 0:
+        return jsonify({"code": 400, "message": "请指定要回滚到的版本号 version"}), 400
+    _, uname = _plugin_actor()
+    conn = get_db()
+    try:
+        row, err = _plugin_or_404(conn, pid)
+        if err:
+            return err
+        if not store.rollback(conn, pid, version):
+            return jsonify({"code": 404, "message": f"版本 {version} 不存在"}), 404
+        get_sandbox().drop(row["name"])
+    finally:
+        conn.close()
+    audit.log("plugin.rollback", target_type="plugin", target_id=row["name"],
+              detail={"plugin_id": pid, "from": row["current_version"], "to": version,
+                      "by": uname})
+    return ok({"id": pid, "current_version": version})
+
+
+@app.route("/api/v1/dev/plugins/<int:pid>", methods=["DELETE"])
+@perm_required("plugin.publish")
+def dev_plugins_delete(pid):
+    """删除插件（仅超管）。连同版本历史与运行产物一起删。"""
+    from plugin_runtime import store
+    from plugin_runtime.sandbox import get_sandbox
+
+    _, uname = _plugin_actor()
+    conn = get_db()
+    try:
+        row, err = _plugin_or_404(conn, pid)
+        if err:
+            return err
+        store.delete_plugin(conn, pid)
+        get_sandbox().drop(row["name"])
+    finally:
+        conn.close()
+    audit.log("plugin.delete", target_type="plugin", target_id=row["name"],
+              detail={"plugin_id": pid, "version": row["current_version"], "by": uname})
     return ok({"deleted": True})
+
+
+# ── AI 造插件 ──
+# 两个入口共用 plugin_runtime.forge.forge_plugin：悬浮对话里的自然语言，
+# 和这里的显式按钮。对话侧在 shipclaw/core.py 里拦截（技能匹配之前）。
+
+@app.route("/api/v1/ai/plugins")
+@login_required
+def ai_plugins_list():
+    """给悬浮 AI 用的插件目录：只看**已启用**的（AI 能用得上的那些）。
+
+    和 /dev/plugins 的区别：那个是管理页（草稿、失败记录、版本都在），
+    这个是能力清单 —— 对话里 AI 说「我可以用哪些插件」时照这个答。
+    """
+    from plugin_runtime import store
+    conn = get_db()
+    try:
+        rows = store.load_runnable(conn)
+    finally:
+        conn.close()
+    return ok([{"name": r["name"], "label": r["label"], "icon": r.get("icon") or "🧩",
+                "description": r.get("description") or "",
+                "trigger_keywords": [k for k in (r.get("trigger_keywords") or "").split(",") if k],
+                "version": r["current_version"]}
+               for r in rows])
+
+
+@app.route("/api/v1/ai/plugins/forge", methods=["POST"])
+@perm_required("plugin.draft")
+def ai_plugins_forge():
+    """让 AI 造一个插件草稿。生成→校验→试跑→落库，全程同步（可能几十秒）。
+
+    **不启用**。造出来的东西要超管在开发者页里试跑并启用才生效 ——
+    这是「AI 造 + 超管启用」信任模型里不可省的那一半。
+    """
+    from plugin_runtime.forge import forge_plugin
+
+    data = request.get_json(silent=True) or {}
+    request_text = (data.get("message") or data.get("request") or "").strip()
+    if not request_text:
+        return jsonify({"code": 400, "message": "请说明想要什么样的判定插件"}), 400
+    uid, uname = _plugin_actor()
+    result = forge_plugin(uid, request_text, username=uname)
+    if not result.get("ok"):
+        # 400 而不是 500：生成失败是预期的业务结果（LLM 写不通一段可执行代码
+        # 是常事），不是服务故障。前端据此显示「AI 第一次没写通，原因是…」。
+        return jsonify({"code": 400,
+                        "message": result.get("error") or "生成失败",
+                        "data": result}), 400
+    return ok(result)
+
+
+def _plugin_text_from_request(data: dict) -> str:
+    """从请求体取插件全文。支持两种形态：直接给 plugin_text，或分块给。
+
+    页面上是「manifest 一块 + 源码一块」两个输入框，所以分块形态是常态；
+    拼回全文必须走 compose_plugin_file —— 手写 `---` 拼接差一个就会变成
+    「缺少 manifest 段」，而那种报错看不出是拼接问题。
+    """
+    from plugin_runtime.manifest import compose_plugin_file
+
+    text = (data.get("plugin_text") or "").strip()
+    if text:
+        return text
+    fm = (data.get("manifest_yaml") or "").strip()
+    body = (data.get("source_py") or "").strip()
+    if fm and body:
+        return compose_plugin_file(fm, body)
+    return ""
+
+
+def _plugin_current_text(pid) -> str:
+    """取库里当前版本的插件全文。找不到返回空串。"""
+    from plugin_runtime import store
+    conn = get_db()
+    try:
+        row = store.get_plugin(conn, pid)
+        if not row:
+            return ""
+        ver = store.get_version(conn, pid, row["current_version"]) or {}
+        return ver.get("source_py") or ""
+    finally:
+        conn.close()
 
 
 # ── ShipClaw 养成状态 API ──
@@ -2505,7 +2963,8 @@ def zone_analyze():
     conn = get_db()
     scope_sql, scope_params = _user_scope()
     rows = conn.execute(f"""
-        SELECT mmsi, avg_speed, max_speed, violation_detected, violation_type,
+        SELECT mmsi, avg_speed, max_speed, violation_detected,
+               {_VCODE_SQL} as vcode, {_VLABEL_SQL} as vlabel, {_VRAW_SQL} as raw_type,
                risk_level, recommended_action, final_assessment, detailed_result
         FROM detection_results{(' WHERE ' + scope_sql) if scope_sql else ''}
     """, scope_params).fetchall()
@@ -2516,15 +2975,8 @@ def zone_analyze():
     zone_point_count = 0     # 区域内总点数（仅参考，统计口径以船舶为单位）
     violated_ships = []
     violation_type_ships: dict[str, int] = {}   # 违规类型 → 船舶数
-
-    # 违规类型 → 中文标签（区域分析展示用）
-    try:
-        from ais_accelerator.violation_catalog import describe as _describe
-        def _vlabel(t):
-            return _describe(t or "")["label"]
-    except Exception:
-        def _vlabel(t):
-            return t or ""
+    # 违规类型标签走全站同一口径 _vlabel()（原先本函数自带一个只认 violation_type 的
+    # 局部版本，那列 90/132 是空的，区域分析的违规类型分布会整片显示「其他违规」）。
 
     def _parse_ts(ts):
         """'2021-07-28T09:28:29Z' / '2021-07-28 09:28:29' → (hour, minute) 或 None。"""
@@ -2540,7 +2992,7 @@ def zone_analyze():
     for r in rows:
         mmsi = r["mmsi"]
         is_violated = bool(r["violation_detected"])
-        vtype = r["violation_type"] or ""
+        vtype = _vlabel(r["vcode"], r["vlabel"], r["raw_type"])
         ship_type = ""
         ship_name = ""
 
@@ -2602,16 +3054,14 @@ def zone_analyze():
             dwell_minutes = 0
             first_entry_hour = None
 
-        risk = (r["risk_level"] or "low").lower()
-        if risk == "middle":
-            risk = "mid"
+        risk = norm_risk(r["risk_level"])
 
         ship_info = {
             "mmsi": mmsi,
             "shipName": ship_name or mmsi,
             "shipType": ship_type or "",
             "violationDetected": is_violated,
-            "violationType": _vlabel(vtype) if is_violated else "",
+            "violationType": vtype if is_violated else "",
             "riskLevel": risk,
             "zoneAvgSpeed": zone_avg_speed,
             "zoneMaxSpeed": zone_max_speed,
@@ -2626,8 +3076,7 @@ def zone_analyze():
         if is_violated:
             violated_ships.append(ship_info)
             if vtype:
-                _vl = _vlabel(vtype)
-                violation_type_ships[_vl] = violation_type_ships.get(_vl, 0) + 1
+                violation_type_ships[vtype] = violation_type_ships.get(vtype, 0) + 1
 
     # ── 船队速度统计（船舶单位的均值，不是点级均值） ──
     ship_avg_speeds = [s["zoneAvgSpeed"] for s in ships_in_zone if s["zoneAvgSpeed"] > 0]
@@ -2855,21 +3304,91 @@ CREATE TABLE IF NOT EXISTS cascade_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_cascade_user ON cascade_logs(user_id);
 
-CREATE TABLE IF NOT EXISTS custom_skills (
+-- 注：custom_skills（skill.md 自定义技能）已下线，建表语句一并删除。
+-- 老库里的那张表和既有数据**不做 DROP** —— 这里只负责不再新建，
+-- 免得一次升级把用户以前写的东西悄悄抹掉。
+
+-- ═══ 插件系统（dsh 风格可执行插件） ═══
+-- 插件 = manifest（frontmatter）+ Python 判定代码，跑在独立子进程里。
+-- 产物走独立的 plugin_findings 表，**不改 detection_results 的三列基线**
+-- （violation_detected / violation_code / risk_level 只由 L1 实测证据 +
+--   risk_engine 确定性引擎写；插件唯一能碰的 risk_level 提升需 can_raise_risk
+--   授权、只升不降、单独审计，见 plugin_runtime/registry.py）。
+CREATE TABLE IF NOT EXISTS plugins (
     id SERIAL PRIMARY KEY,
-    user_id TEXT NOT NULL,
     name TEXT NOT NULL,
     label TEXT NOT NULL,
     icon TEXT DEFAULT '🧩',
     description TEXT DEFAULT '',
+    scope TEXT DEFAULT 'global',
+    origin TEXT DEFAULT 'manual',
+    status TEXT DEFAULT 'draft',
+    trust TEXT DEFAULT 'sandbox',
+    author_user_id TEXT DEFAULT '',
+    author_username TEXT DEFAULT '',
+    created_by_model TEXT DEFAULT '',
+    current_version INTEGER DEFAULT 1,
+    can_raise_risk BOOLEAN DEFAULT FALSE,
+    trigger_keywords TEXT DEFAULT '',
     min_level INTEGER DEFAULT 1,
-    trigger_keywords TEXT NOT NULL,
-    manual_md TEXT NOT NULL,
-    status TEXT DEFAULT 'active',
+    enabled_at TEXT DEFAULT '',
+    enabled_by TEXT DEFAULT '',
+    error_streak INTEGER DEFAULT 0,
+    last_error TEXT DEFAULT '',
     created_at TEXT DEFAULT (to_char(now(),'YYYY-MM-DD HH24:MI:SS')),
     updated_at TEXT DEFAULT (to_char(now(),'YYYY-MM-DD HH24:MI:SS'))
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_custom_skill_uniq ON custom_skills(user_id, name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plugin_uniq ON plugins(name);
+CREATE INDEX IF NOT EXISTS idx_plugin_status ON plugins(status);
+
+-- 版本历史：每次保存新增一行，不可变。回滚只改 plugins.current_version 的指针。
+-- source_py 存**插件文件全文**（--- frontmatter --- + Python 正文），即磁盘上
+-- plugins/<name>/plugin.py 的内容；runner 要的就是这一份，不再拼接。
+-- manifest_yaml 是从全文切出来的便利副本，供页面上分块编辑。
+CREATE TABLE IF NOT EXISTS plugin_versions (
+    id SERIAL PRIMARY KEY,
+    plugin_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    manifest_yaml TEXT NOT NULL,
+    source_py TEXT NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    facts_schema TEXT DEFAULT 'v1',
+    validation_report TEXT DEFAULT '{}',
+    created_by TEXT DEFAULT '',
+    created_by_model TEXT DEFAULT '',
+    created_at TEXT DEFAULT (to_char(now(),'YYYY-MM-DD HH24:MI:SS'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plugin_ver_uniq ON plugin_versions(plugin_id, version);
+
+-- 运行产物。失败/超时也留一行（result <> 'ok'），否则 error_streak 熔断没有依据。
+CREATE TABLE IF NOT EXISTS plugin_findings (
+    id SERIAL PRIMARY KEY,
+    plugin_id INTEGER NOT NULL,
+    plugin_version INTEGER DEFAULT 1,
+    mmsi TEXT DEFAULT '',
+    user_id TEXT DEFAULT 'system',
+    source_file TEXT DEFAULT '',
+    analysis_time TEXT DEFAULT '',
+    result TEXT DEFAULT 'ok',
+    code TEXT DEFAULT '',
+    catalog_code TEXT DEFAULT '',
+    label TEXT DEFAULT '',
+    severity TEXT DEFAULT '',
+    confidence DOUBLE PRECISION DEFAULT 0,
+    evidence TEXT DEFAULT '',
+    metric DOUBLE PRECISION DEFAULT 0,
+    metric_unit TEXT DEFAULT '',
+    span_json TEXT DEFAULT '[]',
+    regulation_ref TEXT DEFAULT '',
+    raise_risk_to TEXT DEFAULT '',
+    error_text TEXT DEFAULT '',
+    logs_json TEXT DEFAULT '[]',
+    elapsed_ms INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (to_char(now(),'YYYY-MM-DD HH24:MI:SS'))
+);
+CREATE INDEX IF NOT EXISTS idx_pfind_plugin ON plugin_findings(plugin_id);
+CREATE INDEX IF NOT EXISTS idx_pfind_mmsi ON plugin_findings(mmsi);
+CREATE INDEX IF NOT EXISTS idx_pfind_user ON plugin_findings(user_id);
 
 CREATE TABLE IF NOT EXISTS organizations (
     id TEXT PRIMARY KEY,
@@ -2895,6 +3414,13 @@ ALTER TABLE detection_results ADD COLUMN IF NOT EXISTS violation_event TEXT DEFA
 ALTER TABLE detection_results ADD COLUMN IF NOT EXISTS violation_code TEXT DEFAULT '';
 ALTER TABLE detection_results ADD COLUMN IF NOT EXISTS violation_subtype TEXT DEFAULT '';
 ALTER TABLE detection_results ADD COLUMN IF NOT EXISTS violation_metric DOUBLE PRECISION DEFAULT 0;
+
+-- 插件产物补列。plugin_findings 是本次新表，新建库直接带上 catalog_code；
+-- 但已经建过表的库（开发过程中跑过的）不会因 CREATE TABLE IF NOT EXISTS 补列，
+-- 所以照上面的约定再补一遍。
+-- catalog_code = code 经 violation_catalog 归一后的**规范码**，认不出时为空串。
+-- code 保留插件自己的词汇（页面上要看得懂），catalog_code 只用于跨插件按规范码聚合。
+ALTER TABLE plugin_findings ADD COLUMN IF NOT EXISTS catalog_code TEXT DEFAULT '';
 
 -- ═══ 阶段 0：权限点 / 系统参数 / 审计日志 ═══
 
@@ -2937,6 +3463,31 @@ def _init_db_tables():
     conn.commit()
     conn.close()
     _seed_roles()
+    _seed_plugins()
+
+
+def _seed_plugins():
+    """把 plugins/<name>/plugin.py 播种进 plugins 表（幂等，只播种不启用）。
+
+    与 _seed_roles 的区别：角色是「每次启动覆盖同步」（代码是唯一真值来源），
+    插件是「同名已存在就跳过」（超管在页面上改过一版，重启不能被冲回去）。
+    这个差异是故意的 —— 见 plugin_runtime/store.py::seed_presets 的说明。
+
+    播种成 draft 而不是 enabled：插件跑的是真代码，启用是超管的显式动作。
+    「未启用即零影响」因此是默认状态，而不是需要验证的例外。
+    """
+    try:
+        from plugin_runtime.store import seed_presets
+        conn = get_db()
+        try:
+            created = seed_presets(conn, ROOT_DIR / "plugins")
+        finally:
+            conn.close()
+        if created:
+            print(f"[init] 预置插件播种 {created} 个（状态为草稿，待超管启用）",
+                  file=sys.stderr)
+    except Exception as e:
+        print(f"[init] 预置插件播种失败（不影响启动）：{e}", file=sys.stderr)
 
 
 def _seed_roles():

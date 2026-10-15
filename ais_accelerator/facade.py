@@ -26,10 +26,12 @@ from typing import Any, Iterator, Optional, Protocol  # 类型注解
 
 from .cache import AnalysisResultCache  # 分析结果缓存
 from .config import AcceleratorConfig  # 加速器配置
+from .flow import FlowField  # 全船队流向/流速场
 from .models import (  # 数据模型
     AISPoint,  # AIS数据点
     AgentAnalysisRecord,  # Agent分析记录
     AnnotatedTrack,  # 标注后的完整轨迹
+    CandidateEvent,  # 候选事件（追越等船-船事件的载体）
     CandidatePackage,  # 候选事件包（含agent_input）
     PipelineMetrics,  # 管线运行指标
     ShipProfile,  # 船舶概要
@@ -91,6 +93,9 @@ class AISAccelerationFacade:  # AIS加速器外观类（统一接口）
         ship: dict[str, Any],  # 船舶信息字典
         points: list[dict[str, Any] | AISPoint],  # 轨迹点列表（原始字典或AISPoint对象）
         water: Optional[WaterChecker] = None,  # 陆地判定器（可选）
+        nearby: Optional[dict[str, list[Any]]] = None,  # 时空邻近船轨迹（供碰撞风险）
+        extra_events: Optional[list[CandidateEvent]] = None,  # 批内预计算的船-船事件（追越）
+        field: Optional[FlowField] = None,  # 全船队流向/流速场（供超速与逆向航行）
     ) -> AnnotatedTrack:
         """对单条轨迹运行标注模式 —— 返回带标记的完整轨迹。"""
         profile = ShipProfile.model_validate(ship)  # 验证并构建船舶概要
@@ -103,13 +108,21 @@ class AISAccelerationFacade:  # AIS加速器外观类（统一接口）
             point, _issues = parse_raw_point(row)  # 解析原始数据行
             if point is not None:  # 如果解析成功
                 normalized.append(point)  # 添加归一化后的点
-        return self.pipeline.annotate_track(profile, normalized, water=water)  # 委托给管线进行标注
+        # nearby / extra_events / field 都来自全船队派生结构（单船管线看不到别的船），
+        # 必须原样转发，否则碰撞风险与追越在应用路径上又变回"从不触发"。
+        return self.pipeline.annotate_track(  # 委托给管线进行标注
+            profile, normalized,  # 船舶与归一化点
+            water=water, nearby=nearby, extra_events=extra_events, field=field,  # 全船队派生结构
+        )
 
     def prepare_track(  # 处理单条内存轨迹，返回候选包列表（服务间直接调用）
         self,
         ship: dict[str, Any],  # 船舶信息字典
         points: list[dict[str, Any] | AISPoint],  # 轨迹点列表
         water: Optional[WaterChecker] = None,  # 陆地判定器（可选）
+        nearby: Optional[dict[str, list[Any]]] = None,  # 时空邻近船轨迹（供碰撞风险）
+        extra_events: Optional[list[CandidateEvent]] = None,  # 批内预计算的船-船事件（追越）
+        field: Optional[FlowField] = None,  # 全船队流向/流速场（供超速与逆向航行）
     ) -> list[CandidatePackage]:
         """Prepare an in-memory track for direct service-to-service use."""
         profile = ShipProfile.model_validate(ship)  # 验证并构建船舶概要
@@ -129,7 +142,10 @@ class AISAccelerationFacade:  # AIS加速器外观类（统一接口）
             invalid_rows=len(points) - len(normalized),  # 无效行数
             ship_count=1,  # 只处理一条船
         )
-        return self.pipeline.packages_for_track(profile, normalized, water=water)  # 委托给管线生成候选包
+        return self.pipeline.packages_for_track(  # 委托给管线生成候选包
+            profile, normalized,  # 船舶与归一化点
+            water=water, nearby=nearby, extra_events=extra_events, field=field,  # 全船队派生结构
+        )
 
     def analyze_file(  # 配合外部 detector 做完整的 Agent 分析（支持缓存）
         self,

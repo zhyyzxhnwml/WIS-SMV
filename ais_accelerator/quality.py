@@ -100,6 +100,7 @@ class TrackNormalizer:
                 speed=speed_n,
                 course=course_n,
                 status=p.status,
+                vessel_type=p.vessel_type,   # 船型不参与归一化，原样透传
                 quality_flags=list(p.quality_flags),
                 tags=list(p.tags),
             ))
@@ -125,6 +126,7 @@ class TrackNormalizer:
                 speed=max(0.0, speed_d),
                 course=course_d % 360.0,
                 status=p.status,
+                vessel_type=p.vessel_type,   # 船型不参与归一化，原样透传
                 quality_flags=list(p.quality_flags),
                 tags=list(p.tags),
             ))
@@ -249,19 +251,73 @@ def parse_raw_point(row: dict[str, Any]) -> Tuple[Optional[AISPoint], list[Quali
     if any(issue.severity == QualitySeverity.CRITICAL for issue in issues):  # 如果有严重质量问题
         return None, issues  # 返回空点和问题列表（不生成AISPoint）
     status = str(row.get("status", "")).strip().lower() or None  # 获取并格式化船舶状态
+    # 船型码：不同数据源列名不一致（MarineCadastre 叫 VesselType，
+    # 本仓 7 列格式叫 vessel_type），两个都认；取不到就是 None ——
+    # 下游的禁渔判定会在船型缺失时退回速度判据，不会因此静默失效。
+    vessel_type = str(
+        row.get("vessel_type") or row.get("VesselType") or ""
+    ).strip() or None
     return (  # 返回AISPoint对象和问题列表
         AISPoint(
             mmsi=mmsi,  # MMSI
             timestamp=timestamp,  # 时间戳
             lat=lat,  # 纬度
             lon=lon,  # 经度
-            speed=max(0.0, min(speed, 102.3)),  # 航速（钳制到有效范围）
-            course=course % 360.0,  # 航向（归一化到0~360度）
+            # 102.3 与 360.0 都是 **AIS 标准的"不可用"编码**（SOG 1023、COG 3600），
+            # 不是越界值，必须原样保留：`course % 360.0` 会把 360.0 归一成 0.0，
+            # 与"正北"混同，此后就再也分不出"航向不可用"——而 `ais_off` 判据
+            # （quality._unavailable_nav_fields）正是靠这两个哨兵值同时命中来认定
+            # "报文收到了但内容整体不可用"。360.0 对三角函数等价于 0.0，
+            # 所以保留下游无任何行为变化。
+            speed=max(0.0, min(speed, 102.3)),  # 航速（钳制到有效范围，102.3 为饱和哨兵）
+            course=360.0 if course == 360.0 else course % 360.0,  # 航向（360.0 哨兵保留，其余归一）
             status=status,  # 船舶状态
+            vessel_type=vessel_type,  # 船型码（禁渔判定用）
             quality_flags=[issue.code for issue in issues],  # 质量问题代码列表
         ),
         issues,  # 质量问题列表
     )
+
+
+# ── AIS 报文"不可用"编码与导航要素整体不可用的判定 ────────────────────
+# AIS 标准给每个动态字段都留了一个"不可用"编码：SOG 1023 → 102.3 节，
+# COG 3600 → 360.0 度，HDG 511 → 511 度。
+#
+# 【为什么必须"全部要素同时不可用"才算异常】
+#   这几个哨兵值**各自单独出现都是合法的**，不是异常。实测这批数据（93.8 万点）：
+#     SOG 饱和 102.3 → 7 点
+#     COG 不可用 360.0 → 4 点
+#     HDG 不可用 511 → 143442 点（占 15.3%，154/535 条船）—— Class B 设备普遍
+#       不上报航向，这是常态而非故障
+#   拿单项当"设备异常"，会把 15% 的正常数据判成违规。三项全不可用 = 这条报文里
+#   没有任何导航信息，才是真异常（实测 4 点 / 2 船）。
+#
+# 【与 ais_gap 的互斥关系】
+#   ais_gap  = 时间上**没收到**报文（由 prepare_track 按上报间隔判定）
+#   ais_off  = 报文**收到了、但内容不可用**（由这里判定）
+#   两者必须互斥，否则同一段缺失会被两个码各报一次。
+#
+# 【为什么没有 hdg 一项】
+#   AISPoint **不保留 heading**：转换后的 CSV 里有 `heading` 列，但 parse_raw_point
+#   没有读它，所以它进不了判据。这里把哨兵值常数与"可扩展的检查表"都留着，
+#   将来若把 heading 接进 AISPoint，往 _NAV_FIELD_CHECKS 里加一行即可，口径不用重想。
+_AIS_SOG_UNAVAILABLE = 102.3  # SOG 饱和哨兵（1023）
+_AIS_COG_UNAVAILABLE = 360.0  # COG 不可用哨兵（3600）
+_AIS_HDG_UNAVAILABLE = 511.0  # HDG 不可用哨兵（511，当前未纳入判据，见上）
+
+_NAV_FIELD_CHECKS: tuple[tuple[str, Any], ...] = (
+    ("sog", lambda point: point.speed >= _AIS_SOG_UNAVAILABLE),
+    ("cog", lambda point: point.course == _AIS_COG_UNAVAILABLE),
+)
+
+
+def _unavailable_nav_fields(point: AISPoint) -> list[str]:  # 报文里取到"不可用"编码的导航要素
+    """返回该报文**全部**导航要素都不可用时的要素名列表；否则返回空列表。
+
+    返回空列表有两种含义（调用方不必区分）：部分要素可用，或全部可用。
+    """
+    unavailable = [name for name, test in _NAV_FIELD_CHECKS if test(point)]  # 逐项检查
+    return unavailable if len(unavailable) == len(_NAV_FIELD_CHECKS) else []  # 全不可用才算
 
 
 def prepare_track(  # AIS数据质量评估 —— 不过滤、不丢点，只打标记
@@ -276,6 +332,8 @@ def prepare_track(  # AIS数据质量评估 —— 不过滤、不丢点，只�
     - 重复点：标记后默认剔除（clean_points=False 时保留）
     - 时间异常点 / AIS中断点：不剔除，标记后保留
     - 位置跳变点：标记后默认剔除（clean_points=False 时保留）
+    - AIS 导航要素整体不可用（SOG 与 COG 同时取到 AIS 标准的"不可用"编码）：
+      不剔除，只标记 —— 报文收到了、时间与位置有效，只是内容不含导航信息
     - 陆地规避（water 传入且 clean_on_land=True）：落在陆地掩码内且远离
       航道走廊的点判为陆地点，标记后默认剔除（clean_points=False 时保留）
     - 被剔除点仍记录 QualityIssue 进报告，供审计与 annotator 打标注
@@ -327,6 +385,24 @@ def prepare_track(  # AIS数据质量评估 —— 不过滤、不丢点，只�
             if config.clean_points:  # 清洗模式：剔除陆地点
                 cleaned += 1  # 剔除计数加1
                 continue  # 跳过陆地点，下一点自动相对最后保留点计算，避免级联误删
+
+        # AIS 导航要素整体不可用（经 ais_off 判定）。
+        # 只依赖该点自身的 speed/course，与前后点无关，所以放在位置序列检查之前。
+        # **不剔除该点**：报文本身收到了、时间戳与位置都有效，只是内容不含导航信息；
+        # 剔除它会连带影响后续点的间隔/跳变判定，还会伪造出一段"信号中断"。
+        unavailable_fields = _unavailable_nav_fields(point)  # 不可用的导航要素
+        if unavailable_fields:  # 全部要素都取到"不可用"编码
+            report.issues.append(  # 记录报文异常问题
+                QualityIssue(
+                    code="ais_off",  # 问题代码
+                    severity=QualitySeverity.WARNING,  # 警告级别
+                    message=f"AIS导航要素不可用: {'/'.join(unavailable_fields)}",  # 描述信息
+                    timestamp=point.timestamp,  # 时间戳
+                    details={"unavailable_fields": unavailable_fields},  # 详细数据
+                )
+            )
+            point.quality_flags.append("ais_off")  # 添加质量标记
+            point.tags.append("[AIS要素不可用]")  # 添加标签
 
         if retained:  # 如果不是第一个点
             previous = retained[-1]  # 前一个点

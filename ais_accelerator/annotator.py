@@ -234,13 +234,21 @@ def _annotate_events(  # 为轨迹添加候选事件标记
 
         # 构建 AnnotationTag
         candidate_label = {  # 事件类型 -> 中文标签的映射
-            "speed_violation": "区域超速",  # 超速
-            "low_speed_fishing": "疑似低速捕捞",  # 低速捕捞
+            "speed_violation": "超速行驶",  # 超速（含区域限速与数据驱动两路判据）
+            "low_speed_fishing": "疑似低速捕捞",  # 低速捕捞（开阔水域作业嫌疑）
+            "illegal_fishing": "违规捕捞",  # 违规捕捞（禁渔区/禁渔期内的法定违规）
             "restricted_area_entry": "进入限制区域",  # 进入禁航区
-            "ais_gap": "AIS信号中断",  # AIS信号中断
+            "anchoring_out_of_bounds": "越界锚泊",  # 越界锚泊
+            "fairway_anchoring": "航道内锚泊",  # 航道内锚泊（数据驱动走廊）
+            "overtaking_violation": "违规追越",  # 违规追越（COLREG 第13条）
+            "give_way_failure": "让路船未让路",  # 让路船未让路（COLREG 第15/16条）
+            "illegal_towing": "违规拖带/并靠",  # 违规拖带/并靠（长时间极小间距同速同行）
+            "wrong_way_navigation": "逆向航行",  # 逆向航行（COLREG 第10条）
+            "collision_risk": "碰撞风险",  # 碰撞风险
+            "ais_gap": "AIS信号中断",  # AIS信号中断（时间上没收到报文）
+            "ais_off": "AIS导航要素不可用",  # 报文收到了但内容整体不可用
             "position_jump": "位置跳变",  # 位置跳变
             "course_anomaly": "航向突变",  # 航向突变
-            "collision_risk": "碰撞风险",  # 碰撞风险
         }.get(event.candidate_type.value, event.candidate_type.value)  # 获取中文标签，默认用英文
 
         tag = AnnotationTag(  # 创建事件标记
@@ -464,6 +472,15 @@ def _extract_features(  # 从管线输出提取ML特征向量
         "min_tcpa_minutes": round(min_tcpa, 2),  # 最小TCPA
         "avg_relative_speed": round(avg_relative_speed, 4),  # 平均相对速度
         "nearby_ship_count": nearby_ship_count,  # 邻近船数量
+        # 各检测器产出的行为违规计数（与碰撞风险并列，供证据面板展开）。
+        # 前三个是单船/区域检测器，后两个是多船检测器（colreg/towing）。
+        # 注意：这几个**不在 FEATURE_NAMES 里**，所以只进 metadata、不进特征向量
+        # ——加它们不会改变向量维度（改了维度，新旧记录的 feature_vector 就不可比了）。
+        "overtaking_count": _annotation_count_by_type(annotations, "overtaking_violation"),
+        "wrong_way_count": _annotation_count_by_type(annotations, "wrong_way_navigation"),
+        "anchoring_out_of_bounds_count": _annotation_count_by_type(annotations, "anchoring_out_of_bounds"),
+        "give_way_count": _annotation_count_by_type(annotations, "give_way_failure"),
+        "illegal_towing_count": _annotation_count_by_type(annotations, "illegal_towing"),
     }
 
     vector = [float(metadata.get(name, 0)) for name in FEATURE_NAMES]  # 按特征名顺序构建浮点向量

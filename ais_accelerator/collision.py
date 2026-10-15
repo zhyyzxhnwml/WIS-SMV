@@ -307,15 +307,23 @@ class CollisionRiskAssessor:
         # f(DCPA): DCPA 越小风险越高
         f_dcpa = 1.0 / (1.0 + (dcpa / self.dcpa_threshold_nm) ** 2)
 
-        # f(TCPA): TCPA 越小风险越高（仅 TCPA > 0 时有意义）
+        # f(TCPA): TCPA 越小风险越高
+        #
+        # 【为什么 tcpa <= 0 时这一项是 0，而不是原先的 0.9】
+        #   _compute_dcpa_tcpa 里 tcpa = min_step * step_minutes，而 min_step 从 0 起
+        #   只增不减 —— 所以 tcpa **永远不会是负数**，原先那两个 (-5, 0] 与 <-5 的
+        #   分支里，后者是死代码，前者只在 tcpa == 0 时命中。
+        #   而 tcpa == 0 的语义是"预测窗内的最近点就是此刻"，也就是两船**正在远离**、
+        #   往后只会更远。把它按"刚错过最近点、极近"给 0.9 是反的：于是每一对背向
+        #   行驶的船（繁忙航道里最平常的情况）都被打上近满分的紧迫度，光靠
+        #   0.3×0.9 + 0.15×f_bearing + 0.15×f_speed ≈ 0.47 就越过 0.4 的中风险线，
+        #   与两船相距多远无关。接线修好、碰撞检测第一次真跑起来时，实测 535 船里
+        #   494 船（92%）被判"碰撞风险"，根因就是这里。
+        #   是否真有危险由 f(DCPA)（最近会遇距离）决定，TCPA <= 0 时这一项不加分。
         if tcpa > 0:
             f_tcpa = 1.0 / (1.0 + (tcpa / self.tcpa_threshold_min) ** 2)
-        elif tcpa > -5:
-            # TCPA 在 -5~0 分钟：已经过了最近点但很近
-            f_tcpa = 0.9
         else:
-            # TCPA < -5 分钟：已经远离最近点
-            f_tcpa = 0.1
+            f_tcpa = 0.0
 
         # f(bearing): 相对方位在船首方向（0°~45° 或 315°~360°）风险更高
         if relative_bearing <= 45 or relative_bearing >= 315:
@@ -361,6 +369,25 @@ class CollisionRiskAssessor:
 
 # ── 碰撞风险检测（集成到 detect.py 的接口） ──
 
+def assess_at_closest(  # 按两点的即时运动要素评估一次碰撞风险
+    own_point: object,  # 本船在最近会遇点上的点
+    target_point: object,  # 目标船在同一时刻的点
+    config: AcceleratorConfig,  # 加速器配置
+) -> CollisionRisk:
+    """不做轨迹预测、只按这两个点的当前运动要素评估一次碰撞风险。
+
+    供 `colreg.py` 做让路归责时使用：那里要的是"**最近会遇那一刻**两船的运动
+    态势"，而不是"从轨迹末端往前推 24 分钟"。用 `assess()` 会拿到以轨迹末端
+    为起点的 DCPA/TCPA，与相遇的时刻根本不是同一个瞬间。
+
+    实现直接复用 `CollisionRiskAssessor._assess_current_only`——它本来就是
+    "没有预测轨迹时"的回退路径，是这两个点的纯函数，这里只是给它一个公开入口。
+
+    两个参数只要求结构上带 mmsi/lat/lon/speed/course，`encounter._Pt` 即可。
+    """
+    return CollisionRiskAssessor(config)._assess_current_only(own_point, target_point)
+
+
 def detect_collision_risks(
     own_points: list[AISPoint],
     nearby_tracks: dict[str, list[AISPoint]],
@@ -376,7 +403,16 @@ def detect_collision_risks(
         config: 加速器配置
 
     Returns:
-        碰撞风险列表（仅包含 CRI 超过中风险阈值的）
+        碰撞风险列表（CRI 超过中风险阈值，且最近会遇距离压到门限以内的）
+
+    为什么要两个条件：CRI 是四个因子的加权和，其中相对方位与相对速度合计权重 0.3。
+    只要这两项都偏"危险"，即使最近会遇距离那项几乎为 0，加权和也能越过 0.4 的中风险线。
+    实测（data/logs/calibrate_collision_gate.txt）被 CRI 判为有风险的船对里，
+    预测最近会遇距离中位数 4.19nm、p90 达 41nm、最大 177nm —— 而参与评估的船对
+    本来就都在 10nm 之内。也就是说单靠 CRI，繁忙航道里"周围有船"就够判成碰撞风险了，
+    535 船里 494 船会中招。所以"最近会遇得多近"必须单独作为前置门限，
+    CRI 退回到它该干的活：在门内区分风险高低。门限取 0.5nm（COLREG 第7条
+    "存在碰撞危险"的口径，约 926 米）。
     """
     if not own_points or not nearby_tracks:
         return []
@@ -389,8 +425,13 @@ def detect_collision_risks(
             continue
 
         risk = assessor.assess(own_points, target_points)
-        if risk and risk.cri >= config.cri_medium_threshold:
-            risks.append(risk)
+        if risk is None:
+            continue
+        if risk.cri < config.cri_medium_threshold:
+            continue
+        if risk.dcpa_nm > config.collision_dcpa_gate_nm:
+            continue
+        risks.append(risk)
 
     # 按 CRI 降序排序
     risks.sort(key=lambda r: r.cri, reverse=True)

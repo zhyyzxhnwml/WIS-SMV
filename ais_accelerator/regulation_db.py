@@ -90,8 +90,9 @@ EMBEDDING_DIM = 1024  # Milvus 集合向量维度（既有集合固定为 1024�
 # 结论：**不要把这个下限当相关性判据**。它的真实作用只有一个 —— 砍掉分布最尾部
 # 的噪声（自命中是 1.0000，尾部噪声实测 ≤0.5 区间），是个很弱的兜底。
 # 真正决定"检索到哪条法"的是另外两样东西：
-#   1. violation_catalog.REG_ANCHORS 锚定表（11/11 命中，人工确认过的条号；
-#      2026-10-09 复测：11/11 取到非空正文）
+#   1. violation_catalog.REG_ANCHORS 锚定表（人工确认过的条号；2026-10-09 复测
+#      11/11 取到非空正文。2026-10-10 新增追越/逆向/越界锚泊三条锚定 —— 追越与
+#      逆向走 COLREG 第13/10条，越界锚泊走《福州港港口章程》第12条，需复测取到正文）
 #   2. search() 的 violation_code 字段过滤
 # 锚定命中时**直接返回、不受本下限约束**（所以第14条 0.583 照样能出来）。
 # MIN_SIMILARITY 只在两步都落空、退到纯向量检索时才生效。
@@ -381,6 +382,7 @@ class RegulationParser:
                 "航行", "安全", "碰撞", "避碰", "超速", "限速", "禁航", "禁渔",
                 "AIS", "信号", "渔船", "港口", "航道", "锚地", "台风", "锚泊",
                 "追越", "对遇", "交叉", "让路", "直航", "搁浅", "触礁",
+                "分道通航", "通航分道", "船舶总流向", "逆行",
                 "海事", "搜救", "应急", "签证", "检验", "登记",
             ]
             for kw in maritime_kws:
@@ -397,8 +399,38 @@ class RegulationParser:
                 violation_codes.append("illegal_fishing")
             if any(kw in content for kw in ["AIS", "信号", "关闭", "关闭设备"]):
                 violation_codes.append("ais_off")
-            if any(kw in content for kw in ["碰撞", "避碰", "让路", "追越"]):
+            # 「追越」原先是并进 collision_risk 的，但追越与碰撞是**两类**违规
+            # （追越是第13条的让路义务，碰撞是第14/15/16条的会遇局面），
+            # 混在一起会让"违规追越"检索到碰撞条款。第13条自成一条路径。
+            if "追越" in content:
+                violation_codes.append("overtaking_violation")
+            if any(kw in content for kw in ["碰撞", "避碰", "让路"]):
                 violation_codes.append("collision_risk")
+            # 让路义务（第15/16/17条）单独标码。原先只有"让路"→collision_risk 一条，
+            # 于是交叉相遇那几条条文全被标成"风险状态"，按 give_way_failure 过滤时
+            # 一条都取不到（此码主要靠 REG_ANCHORS 取条，这里是第二级过滤的补登记）。
+            if any(kw in content for kw in ["让路船", "直航船", "让路"]):
+                violation_codes.append("give_way_failure")
+            # 拖带：《海上交通安全法》第45条逐字讲拖带，关键词精确，不会误召。
+            # 并靠没有这么干净的词，不硬凑（那一侧走 REG_ANCHORS 的第47条）。
+            if "拖带" in content:
+                violation_codes.append("illegal_towing")
+            # 分道通航制（第10条）与锚地管理：两者原先在标码表里没有对应项，
+            # 相关法条入库后不会被任何违规类型检索到。
+            if any(kw in content for kw in ["分道通航", "通航分道", "船舶总流向", "定线制", "逆行"]):
+                violation_codes.append("wrong_way_navigation")
+            if any(kw in content for kw in ["禁止锚泊", "擅自锚泊", "锚地范围", "锚泊"]):
+                violation_codes.append("anchoring_out_of_bounds")
+            # 航道内锚泊：与"停在禁锚水域"不是同一条法源 —— 这一档问的是
+            # "停泊妨碍了通航"，所以取「锚泊/停泊」与「航道/通航/碍航」的**同现**，
+            # 而不是把上面那条宽泛的“锚泊”分支复制一遍：上面那条的末尾关键词就是
+            # "锚泊"两字，凡是讲锚地的法条都会命中，若在这里再无条件挂一个码，
+            # 第二级过滤对这两个码就完全失去区分能力了。
+            # （与 illegal_towing 的"并靠没有这么干净的词就不硬凑"是同一个取舍。）
+            if ("锚泊" in content or "停泊" in content) and any(
+                kw in content for kw in ["航道", "通航", "碍航", "阻塞"]
+            ):
+                violation_codes.append("fairway_anchoring")
 
             article_num = cn_to_int(cn_num)
             article = RegulationArticle(

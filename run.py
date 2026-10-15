@@ -56,6 +56,7 @@ CURRENT_USER_ID = "system"
 
 from triage_engine.model import TriageModel  # ML分类模型
 from triage_engine.router import TriageRouter  # ML路由分类器
+from triage_engine.router import RISK_GATE_THRESHOLD  # LLM 门控阈值（与 L2 同源，勿另行硬编码）
 from triage_engine.milvus_client import MilvusClient  # Milvus向量数据库客户端
 from llm_layer.handler import LLMHandler  # LLM违规分析处理模块
 from llm_layer.feedback import FeedbackLoop, check_and_retrain  # 反馈闭环（自动累积+增量训练）
@@ -97,7 +98,15 @@ OUTPUT_FIELDS = [  # CSV输出字段名列表
     "source_file",  # 源文件名
     "analysis_time",  # 分析时间
     "violation_detected",  # 是否检测到违规
-    "violation_type",  # 违规类型
+    "violation_type",  # 违规类型（LLM 原始判性，可能是自由文本）
+    # 规范三级分类：二级规范码 / 三级细类 / 定档实测量值。
+    # 这三列此前只写库、不写 CSV——而 CSV 是导出件、也是跑实验要读的产物，
+    # 于是分析时拿到的是 violation_type 那个有十余种脏拼法的原始字段
+    # （实测出现过 AIS01 / AIS012 / AIS1001 / ais异常关闭 等），
+    # 用它做任何按类型统计都是在统计 LLM 的拼写习惯。
+    "violation_code",  # 二级规范码（CANONICAL 词表）
+    "violation_subtype",  # 三级细类
+    "violation_metric",  # 定档实测量值
     "violation_label",  # 违规标签
     "confidence",  # 置信度
     "risk_level",  # 风险等级
@@ -249,8 +258,17 @@ def convert_csv(raw_path: str, cache_dir: str) -> str:  # raw_path: 原始CSV路
     with open(raw, "r", encoding="utf-8-sig") as fin,open(converted_path, "w", encoding="utf-8", newline="") as fout:  # 以写入方式打开目标CSV# 以只读方式打开原始CSV
         reader = csv.DictReader(fin)  # CSV字典读取器
         reader.fieldnames = [name.strip().lower() for name in reader.fieldnames]  # 字段名统一小写+去空白
-        # 判断需要的列：加速器要 mmsi, time, lat, lon, speed, course
-        fields = [f for f in ["mmsi", "time", "lon", "lat", "course", "heading", "speed"]  # 需要的字段列表
+        # 船型码列名统一成 vessel_type。不同数据源叫法不同：MarineCadastre 是
+        # VesselType（小写后成 vesseltype），本仓 7 列格式是 vessel_type。
+        # 不统一的后果很隐蔽 —— 船型在这一步被丢掉，下游禁渔判定静默退回
+        # 速度代理判据，结果看着正常其实判错（实测：NOAA 官方禁渔区上
+        # 两条真实商业渔船违规全部漏报）。
+        if "vesseltype" in reader.fieldnames and "vessel_type" not in reader.fieldnames:  # 别名归一
+            reader.fieldnames = ["vessel_type" if name == "vesseltype" else name  # 重命名船型列
+                                 for name in reader.fieldnames]
+        # 判断需要的列：加速器要 mmsi, time, lat, lon, speed, course（+可选船型）
+        fields = [f for f in ["mmsi", "time", "lon", "lat", "course", "heading", "speed",
+                              "vessel_type"]  # 需要的字段列表
                   if f in reader.fieldnames]  # 只保留实际存在的字段
         writer = csv.DictWriter(fout, fieldnames=fields)  # CSV字典写入器
         writer.writeheader()  # 写入表头
@@ -299,12 +317,19 @@ def save_results(results: list[dict], output_path: str):  # results: 处理结�
                 "source_file": _get_source_stem(r.get("pipeline_metrics")),  # 源文件名
                 "analysis_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # 当前分析时间
                 "violation_detected": str(llm.get("violation_detected", "")),  # 是否检测到违规
-                "violation_type": llm.get("violation_type", "") or "",  # 违规类型
+                "violation_type": llm.get("violation_type", "") or "",  # 违规类型（LLM 原始判性）
+                "violation_code": llm.get("violation_code", "") or "",  # 二级规范码
+                "violation_subtype": llm.get("violation_subtype", "") or "",  # 三级细类
+                "violation_metric": llm.get("violation_metric", ""),  # 定档实测量值
                 "violation_label": llm.get("violation_label", "") or "",  # 违规标签
                 "confidence": f"{llm.get('confidence', 0):.2%}" if llm  # 置信度百分比
                              else f"{routing.get('ml_confidence', 0):.2%}",  # 无LLM时使用ML置信度
+                # 无 LLM 时按路由推断。此处曾写 "middle"——那是**事件优先级**
+                # (EventPriority) 的词表；risk_level 的词表是 {high, mid, low}。
+                # 两者长得像、列却不同（models.py 的 priority 字段 / risk_engine.py
+                # 的归一），混写会让仪表盘的风险饼图把同一档拆成两个扇区。
                 "risk_level": llm.get("risk_level", "low") if llm  # 风险等级
-                              else ("low" if routing.get("routing") == "normal" else "middle"),  # 无LLM时基于路由推断
+                              else ("low" if routing.get("routing") == "normal" else "mid"),  # 无LLM时基于路由推断
                 "routing": routing.get("routing", "") if routing else "",  # ML路由结果
                 "recommended_action": llm.get("recommended_action", ""),  # 建议操作
                 "final_assessment": (llm.get("final_assessment", "") or "")[:200],  # 最终评估（截取前200字符）
@@ -342,27 +367,86 @@ def process_file(csv_path: str):  # csv_path: CSV文件路径
     total_valid_rows = ingest_stats.valid_rows  # 有效行数
     print(f"    原始行: {total_raw_rows} | 有效: {total_valid_rows} | 船舶: {total_ships}")  # 打印数据载入统计
 
-    # 陆地规避：用本批全部船的原始轨迹点构建航道走廊（WaterChecker），
-    # 传给 annotate_track 让清洗层剔除"落在陆地掩码内且远离航道"的点。
+    # 全船队派生结构：航道走廊（陆地规避）+ 流向/流速场 + 多船时空索引 + 违规追越。
+    # 这四样都要求「看得到全体船」，而下游是逐船调用的，所以只能在这里一次算好再下发。
+    # 合并成一次遍历是有意的：iter_ship_tracks() 每趟要重读 SQLite 并重建 93.7 万个
+    # AISPoint（实测约 10 秒），分开建就是四趟白跑。
     try:
-        from ais_accelerator.water import WaterChecker  # 陆地/水域判定器
-        _lon_lats = [(p.lon, p.lat) for _s, _pts in store.iter_ship_tracks() for p in _pts]  # 收集全部轨迹点经纬度
-        water = WaterChecker(lon_lats=_lon_lats) if _lon_lats else None  # 构建判定器（无数据则None）
-        _on_land = sum(1 for lon, lat in _lon_lats if water is not None and water.is_on_land(lon, lat))  # 统计陆地点数
+        _t_ctx = time.perf_counter()  # 计时起点
+        fleet = orchestrator.accelerator.pipeline.build_fleet_context()  # 一次遍历算齐
+        water = fleet.water  # 陆地判定器
         if water is not None:
-            print(f"    ⛰ 陆地规避: 航道走廊 {len(water.corridor)} 格 | 原始点中陆地点 {_on_land} 个")  # 打印陆地规避信息
-    except Exception as _water_err:
-        water = None  # 陆地判定失败不影响主流程
-        print(f"    ⚠ 陆地规避初始化失败（已忽略）: {_water_err}")  # 打印警告
+            print(f"    ⛰ 陆地规避: 航道走廊 {len(water.corridor)} 格")  # 打印陆地规避信息
+        if fleet.field is not None:
+            _fs = fleet.field.stats()  # 场统计
+            print(f"    🧭 流向流速场: {_fs.get('cells', 0)} 格 / "
+                  f"{_fs.get('cells_with_modes', 0)} 格有主导航向")  # 打印流向场信息
+        _ovt_ships = len(fleet.overtakings)  # 追越事件涉及的船数
+        _ovt_events = sum(len(v) for v in fleet.overtakings.values())  # 追越事件数
+        _gwy_events = sum(len(v) for v in fleet.give_ways.values())  # 让路失败事件数
+        _tow_events = sum(len(v) for v in fleet.towings.values())  # 拖带/并靠事件数
+        print(f"    ⚓ 多船遭遇: 索引 {len(fleet.index._bucket_ships) if fleet.index else 0} 桶 | "
+              f"违规追越 {_ovt_events} 起 / {_ovt_ships} 船 | "
+              f"让路失败 {_gwy_events} 起 | 拖带并靠 {_tow_events} 起 | {fleet.pairwise_seconds:.1f}s")
+        if fleet.pairwise_seconds > orchestrator.accelerator.pipeline.config.interaction_max_seconds:
+            print(f"    ⚠ 多船检测超出预算 "
+                  f"{orchestrator.accelerator.pipeline.config.interaction_max_seconds:.0f}s")  # 超预算提示
+        print(f"    ⏱ 派生结构总耗时 {time.perf_counter()-_t_ctx:.1f}s")  # 打印总耗时
+    except Exception as _ctx_err:
+        water = None  # 派生结构失败不影响主流程
+        fleet = None  # 无派生结构：碰撞与追越不检测，其余照常
+        print(f"    ⚠ 全船队派生结构初始化失败（已忽略）: {_ctx_err}")  # 打印警告
+
+    # 窗口特征的「同刻点表」：L2 的 64 维契约里 reserved_0..22 载 23 维窗口运动学特征，
+    # 其中最近会遇距离要看到当天全体船。全批建一次后各船共用 —— 逐船重建等于把
+    # 全船队分桶 N 遍。建不出来（无派生结构）就整体不填，让 has_w=0，
+    # **不能**拿"没有邻居信息"的 23 维冒充有邻居的，那是训练/推理错配。
+    win_tindex = None  # 建不出来时为 None
+    win_feat = None  # 模块句柄：导入失败则本批整批不填（而不是逐船抛异常）
+    try:
+        # 别名绑定成局部名，所以下面**只能**用 win_feat：写 window_feat 会去查全局，
+        # 而全局里没有这个名字（真踩过：NameError 被 except 吞掉 → 静默不填特征）。
+        from triage_engine import window_feat as win_feat  # 生产侧窗口特征（与训练同源）
+        if fleet is not None and fleet.light_tracks:
+            _t_win = time.perf_counter()  # 计时起点
+            win_tindex = win_feat.build_tindex(fleet.light_tracks)  # 全批一次
+            _npt = sum(len(v) for v in fleet.light_tracks.values())  # 参与分桶的点数
+            print(f"    🪟 窗口特征同刻点表: {len(win_tindex)} 刻 / {_npt} 点 | "
+                  f"{time.perf_counter()-_t_win:.1f}s")
+    except Exception as _win_err:
+        win_tindex = None  # 失败则整批不填窗口特征（has_w=0），不影响其余流程
+        print(f"    ⚠ 窗口特征点表构建失败（本批不填 reserved）: {_win_err}")
 
     results = []  # 处理结果列表
+
+    # ── 插件层：每批只重置一次预算 ──
+    # 预算是「整批 process_file 的插件总用时上限」（默认 120s），不是每船的。
+    # 必须在船循环**之外**重置：放进循环里等于每船都恢复满额，预算就失效了，
+    # 500 船 × 每船 3s 会把流水线拖到几十分钟。
+    try:
+        from plugin_runtime import preload_registry
+        _enabled = preload_registry()
+        if _enabled:
+            print(f"🧩 插件层：本批启用 {len(_enabled)} 个插件 — "
+                  + "、".join(p["label"] for p in _enabled))
+        else:
+            print("🧩 插件层：无已启用插件")
+    except Exception as _pl_err:
+        print(f"⚠ 插件层初始化失败（本批不跑插件）: {_pl_err}")
+
     # 逐条船遍历
     for idx, (ship, raw_points) in enumerate(store.iter_ship_tracks(), 1):  # idx: 船舶序号; ship: 船舶元数据; raw_points: 原始轨迹点
         print_sep(f"⚓ [{idx}/{total_ships}] MMSI={ship.mmsi}")  # 打印船舶分隔线和序号
 
         # ━━ 第一层：AIS 加速器 ━━
         print("  [1/3] AIS 加速器 — 质量清洗 → 分段 → 事件检测")  # 提示当前层级
-        annotated = orchestrator.accelerator.annotate_track(ship, raw_points, water=water)  # 单条船舶的加速器标注结果
+        annotated = orchestrator.accelerator.annotate_track(  # 单条船舶的加速器标注结果
+            ship, raw_points,  # 船舶与原始点
+            water=water,  # 陆地判定器
+            field=fleet.field if fleet else None,  # 流向/流速场（数据驱动超速与逆向航行）
+            nearby=fleet.nearby_for(raw_points, ship.mmsi, orchestrator.accelerator.pipeline.config) if fleet else None,  # 邻近船（碰撞风险）
+            extra_events=fleet.events_for(ship.mmsi) if fleet else None,  # 本船的多船事件（追越/让路/拖带）
+        )
 
         # 加速器输出摘要
         anno_types = {}  # 各类标注计数
@@ -381,9 +465,27 @@ def process_file(csv_path: str):  # csv_path: CSV文件路径
         fv = annotated.feature_vector  # 轨迹特征向量（22维）
         if len(fv) == 22:  # 如果只有22维实际特征
             fv = fv + [0.0] * 42  # 填充42个0到64维
+        win = None  # 本船的 23 维窗口特征（算不出来则 None → has_w=0）
+        if win_feat is not None and win_tindex:  # 无同刻点表则整批不填，见上
+            # 用**清洗后**的轨迹（`annotated.track`），与训练落盘 `winprod_*.json`
+            # 走的同一条路（`dump_winfeat.py` 也是取 `AnnotatedTrack.track`）；
+            # 换成原始点会让最近会遇距离看到已被清洗掉的点，属于训练/推理错配。
+            win = win_feat.features_max(annotated.track, win_tindex)
+            fv = win_feat.fill_reserved(fv, win)  # 写 reserved_0..22 + has_w
+        # 门控判据（可用环境变量 GATE_MODE 一键回退，不需要改代码）：
+        #   evidence（默认）：L1 无候选事件才送 LLM —— 注入集上三个场景全部
+        #                     同时赢成本与质量（100%@27% / 67.4%@32.5% / 79.4%@44.2%，
+        #                     现役判据是 64.3%@100%），详见 triage_engine/router.py 第 2b 步。
+        #   risk            ：退回原来的风险分阈值判据。
+        # 风险提示：在真实数据上新判据只覆盖 5.5% 的事故船-日（L1 在真数据上
+        #           报掉 91% 的船，所以"无事件"≈"安静船"）——它的收益是成本
+        #           （调用率 6.2% vs 16.6~17.3%），代价是这部分召回。
+        #           见 experiments/paper/gate_on_hawaii.py 的"召回风险检查"。
+        _gate = os.environ.get("GATE_MODE", "evidence").strip().lower()
         decision = router.route(  # ML路由分类决策
             feature_vector=fv,  # 特征向量
             mmsi=ship.mmsi,  # 船舶MMSI号
+            n_events=len(annotated.events) if _gate == "evidence" else None,
         )
 
         # ML 结果输出
@@ -392,12 +494,21 @@ def process_file(csv_path: str):  # csv_path: CSV文件路径
         print(f"    ├ 分类: {decision.ml_category} | 置信度: {decision.ml_confidence:.1%}")  # ML分类结果和置信度
         print(f"    ├ 路由: {decision.routing}{similar_info}")  # 路由决策及相似轨迹信息
         print(f"    ├ 概率: {probs}")  # 各分类概率分布
+        print(f"    ├ 窗口特征: {'23 维已填 (has_w=1)' if win else '未算出 (has_w=0)'}")  # reserved_0..22 是否带了值
         print(f"    └ 耗时: {decision.triage_latency_ms:.0f}ms")  # ML路由耗时（毫秒）
 
         # 构建 entry
         entry = annotated.to_agent_input()  # 转换为Agent输入格式
         entry["mmsi"] = ship.mmsi  # 船舶MMSI号
         entry["routing"] = decision.to_dict()  # 路由决策转为字典
+
+        # ── 把判定所依据的东西交给 LLM（原先一个都没给）──
+        # 23 维窗口特征具名化：模型吃的仍是上面那个定长 `fv`（64 维契约不动），
+        # 这里只是**另存一份看得懂的**给 prompt 用。它含 min_sep_nm —— 与最近
+        # 他船的实测会遇距离，而违规就住在两船的关系里。原先这项只存在于局部
+        # 变量 `win` 里，出了这个函数就没了，prompt 侧无从取用。
+        # （L2 的风险分/四类概率走 `RoutingDecision.to_dict()`，见 router.py。）
+        entry["window_features"] = win_feat.named(win) if win_feat is not None else None
 
         # 如果跳 LLM，直接收集
         if args.no_llm:  # 如果指定了--no-llm参数（跳过LLM层）
@@ -406,8 +517,10 @@ def process_file(csv_path: str):  # csv_path: CSV文件路径
             print(f"    ▶ 结果: 路由={decision.routing} (置信度 {decision.ml_confidence:.0%})")  # 打印简化结果
             continue  # 跳过LLM层，处理下一艘船
 
-        # ━━ 第三层：LLM 判定（使用 orchestrator 的带记忆分析） ━━
-        print(f"  [3/3] LLM 判定 — 模板: {decision.llm_prompt_template}")  # 提示当前层级及使用的提示模板
+        # ━━ 第三层：判定（LLM 或门控跳过后由 L1 证据给出） ━━
+        _gate_in = bool(getattr(decision, "needs_llm", True))  # 门控是否放行
+        print(f"  [3/3] 判定层 — 模板: {decision.llm_prompt_template} | "
+              f"门控: {'放行 LLM' if _gate_in else '跳过 LLM'}")  # 提示当前层级与门控结论
 
         # 注意：不再用 PatternMemory 跳过 LLM
         # 记忆系统只用于小慧智能体（个性化对话），不干预检测管道的判定
@@ -425,12 +538,26 @@ def process_file(csv_path: str):  # csv_path: CSV文件路径
             except Exception:  # 插入失败时静默跳过
                 pass
 
-        # 调用 LLM（通过 orchestrator）
-        llm_result = orchestrator._llm_with_memory(
-            track=annotated,
-            entry=entry,
-            routing_decision=decision,
-        )
+        # ── 门控：要不要花 LLM 由 L2 的风险分决定 ──
+        # `decision.needs_llm` 早就算好了（triage_engine/router.py 第 2b 步，
+        # risk_score >= RISK_GATE_THRESHOLD），但**全仓原先没有任何地方读它** ——
+        # 每船必调 LLM，实测报警率 92.6%、最终判定 lift 0.88（比乱抓还差），
+        # 而这层门本来就是把 LLM 预算压在 L2 风险分最高的那一小撮船上。
+        # 不放行的船判定交给 L1 实测证据（_verdict_without_llm），不花 LLM 预算。
+        if _gate_in:
+            llm_result = orchestrator._llm_with_memory(
+                track=annotated,
+                entry=entry,
+                routing_decision=decision,
+            )
+        else:
+            llm_result = orchestrator._verdict_without_llm(
+                track=annotated,
+                entry=entry,
+                routing_decision=decision,
+            )
+            print(f"    ↷ 跳过 LLM（风险分 {getattr(decision, 'risk_score', 0) or 0:.4f} < "
+                  f"{RISK_GATE_THRESHOLD}）→ 判定由 L1 实测证据给出")
 
         # LLM 不可用时返回安全默认值，不再抛异常中断
         if llm_result and llm_result.get("error") == "llm_unavailable":
@@ -448,7 +575,17 @@ def process_file(csv_path: str):  # csv_path: CSV文件路径
             from ais_accelerator.risk_engine import assess_risk, normalize_risk_level
             from ais_accelerator.violation_catalog import REG_ANCHORS, normalize_violation_code
             _vtype_raw = llm_result.get("violation_type", "")
-            _vcode = normalize_violation_code(_vtype_raw) if llm_result.get("violation_detected") else "unknown"
+            # 规范码优先取 orchestrator.classify() 的物化结果，而不是从 violation_type
+            # 重新推导：classify() 以 L1 实测事件的 candidate_type 定码，而 violation_type
+            # 是 LLM 的原始判性——L1 提升的场景下它被**刻意留空**（见 orchestrator.py
+            # 「violation_type 留空：它代表"LLM 的原始判性"」），从空串推导必然得到
+            # unknown，于是 L1 实锤的追越/逆向/碰撞全部落到 base_risk=30（全表最低档）。
+            # 实测：classify("", L1追越事件) 正确给出 overtaking_violation(base_risk=65)，
+            # 而 normalize_violation_code("") 给出 unknown(30)。检测越准判得越轻。
+            _vcode = (llm_result.get("violation_code") or "").strip()
+            if not _vcode or _vcode == "unknown":
+                _vcode = (normalize_violation_code(_vtype_raw)
+                          if llm_result.get("violation_detected") else "unknown")
             # 证据点数量：从加速器事件取最大 evidence_points
             _ev_counts = [len(ev.get("evidence_points", [])) for ev in (entry.get("events") or [])]
             _max_ev = max(_ev_counts) if _ev_counts else 0
@@ -467,6 +604,11 @@ def process_file(csv_path: str):  # csv_path: CSV文件路径
             _has_reg = bool(_vcode in REG_ANCHORS and REG_ANCHORS[_vcode])
             _ql = (annotated.quality_report.level if annotated.quality_report else "good") or "good"
             _llm_risk = llm_result.get("risk_level")
+            # L2 风险门控立的判定：规范码可能是 unknown（模型不产出违规类型，只给风险分），
+            # unknown 的 base_risk=30 → 引擎会给出"违规但低风险"的自相矛盾行。
+            # 与 L1 提升把 risk_level 抬到 mid 同一口径，这里用 extra_bonus 补到 mid（≥40）。
+            _bonus = 15 if (llm_result.get("detection_source") == "l2_risk_gate"
+                            and llm_result.get("violation_detected")) else 0
             _risk = assess_risk(
                 violation_code=_vcode,
                 evidence_count=_max_ev if llm_result.get("violation_detected") else 0,
@@ -474,6 +616,7 @@ def process_file(csv_path: str):  # csv_path: CSV文件路径
                 has_regulation=_has_reg,
                 quality_level=_ql,
                 llm_risk=_llm_risk,
+                extra_bonus=_bonus,
             )
             llm_result["risk_level"] = _risk["level"]
             llm_result["risk_score"] = _risk["score"]
@@ -487,6 +630,31 @@ def process_file(csv_path: str):  # csv_path: CSV文件路径
             from ais_accelerator.risk_engine import normalize_risk_level
             llm_result["risk_level"] = normalize_risk_level(llm_result.get("risk_level"))
             print(f"    ⚠ risk_engine 失败，回退LLM原值: {_risk_err}")
+
+        # ━━ 插件判定（dsh 风格可执行插件，附加式） ━━
+        # 落点刻意选在这里：L1 事件、L2 路由、L3 LLM、risk_engine 的确定性覆盖
+        # 全部已尘埃落定。插件拿到只读的 facts.base，代码层面没有写
+        # violation_detected / violation_code 的入口；唯一能改的 risk_level
+        # 需 can_raise_risk 授权且只升不降，并单独审计（见 registry._maybe_raise_risk）。
+        # 异常一律吞掉：插件层出问题绝不许影响主判定。
+        try:
+            from plugin_runtime import run_adjudicators
+            # 规则提供者挂在 pipeline 上（facade 自身没有 rules 属性 —— 写成
+            # orchestrator.accelerator.rules 会静默拿到 None，于是 facts.zones 恒为空，
+            # 所有依赖区域几何的插件在线上永远不命中。这个坑踩过一次：日志只会显示
+            # 「本批启用 1 个插件」，然后一条产物都没有，看起来像插件没生效）。
+            _rule_provider = getattr(getattr(orchestrator.accelerator, "pipeline", None),
+                                     "rules", None)
+            _pf = run_adjudicators(
+                entry, llm_result, rules=_rule_provider,
+                user_id=CURRENT_USER_ID, source_file=source_name, mmsi=ship.mmsi,
+            )
+            if _pf:
+                entry["plugin_findings"] = _pf
+                from plugin_runtime.registry import findings_summary
+                print(f"    🧩 插件附加判定: {findings_summary(_pf)}")
+        except Exception as _plugin_err:
+            print(f"    ⚠ 插件判定失败（已忽略，不影响主判定）: {_plugin_err}")
 
         results.append(entry)  # 将完整结果加入结果列表
 
@@ -635,7 +803,9 @@ def process_file(csv_path: str):  # csv_path: CSV文件路径
             print(f"    ⚠ 写入数据库失败: {_db_err}")
 
         # 反馈闭环：将 LLM 判定结果回流为训练数据
-        if feedback:  # 反馈闭环可能为 None（LLM 不可用时）
+        # 只回流**真正被 LLM 判过**的：feedback 收的是弱标签，把 L1 立的判定当
+        # LLM 结论喂进去，等于给训练集贴了错误来源的标签（数据必须是真实的）。
+        if feedback and not llm_result.get("llm_skipped"):  # 反馈闭环可能为 None（LLM 不可用时）
             feedback.process_result(  # 将本次结果回馈到训练数据
                 case_id=f"{ship.mmsi}_{datetime.now().strftime('%Y%m%d%H%M%S')}",  # 唯一案例ID（MMSI_时间戳）
                 ml_prediction=decision.ml_category,  # ML预测分类
@@ -701,11 +871,15 @@ def process_file(csv_path: str):  # csv_path: CSV文件路径
     # 汇总
     routes = {}  # 各类路由计数
     vios = 0  # 违规船舶计数
+    vio_types = {}  # 违规类型（规范码）→ 船数，用于看清类型是否真的分化
     for r in results:  # 遍历所有处理结果
         rt = r.get("routing", {}).get("routing", "?") if r.get("routing") else "?"  # 获取路由分类
         routes[rt] = routes.get(rt, 0) + 1  # 按路由类型计数
         if r.get("llm_result", {}).get("violation_detected"):  # 如果LLM检测到违规
             vios += 1  # 违规计数加1
+            # 取与落库同一列（orchestrator 的 classify() 产出），口径和 detection_results 一致
+            _vc = r.get("llm_result", {}).get("violation_code") or "unknown"
+            vio_types[_vc] = vio_types.get(_vc, 0) + 1
 
     print(f"\n{'='*60}")  # 打印汇总分隔线
     print(f"  ✅ 文件处理完成: {len(results)} 条船舶")  # 打印完成提示
@@ -717,6 +891,16 @@ def process_file(csv_path: str):  # csv_path: CSV文件路径
 
     if not args.no_llm:  # 如果启用了LLM层
         print(f"  违规判定: {vios}/{len(results)} 艘违规 ({vios/max(len(results),1)*100:.1f}%)")  # 违规率统计
+        if vio_types:  # 违规类型分布（与 detection_results.violation_code 同口径）
+            _labels = {}
+            try:
+                from ais_accelerator.violation_catalog import CANONICAL
+                _labels = {k: v.get("label", k) for k, v in CANONICAL.items()}
+            except Exception:
+                pass
+            print(f"  违规类型分布:")  # 类型分化一眼可见，不必再去翻数据库
+            for _code, _n in sorted(vio_types.items(), key=lambda x: -x[1]):
+                print(f"    {_labels.get(_code, _code):<14} {_n} 艘  [{_code}]")
     print(f"  输出文件: {Path(OUTPUT).resolve() / f'results_{source_name}.csv'}")  # 输出文件路径
 
     # 文件处理完后检查是否需要增量训练

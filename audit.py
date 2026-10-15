@@ -5,7 +5,7 @@ audit.py — 审计日志写入与查询
 【这个文件做什么？】
   记录「谁在什么时候对什么做了什么、结果如何」。阶段 0 只覆盖认证与系统管理动作
   （登录/登出/登录失败、用户增删改、组织增删改、系统参数修改）；
-  规则包激活、provider 与密钥变更在各自阶段接入。
+  provider 与密钥变更在阶段 1 接入，插件动作在阶段 2 接入。
 
 【两条硬约束】
   1. **写入失败绝不抛异常**。审计是旁路，不能拖垮业务 —— 登录该成功还得成功。
@@ -63,13 +63,23 @@ KNOWN_ACTIONS: dict[str, str] = {
     "provider.delete":       "删除模型提供商",
     "provider.key_update":   "修改 API 密钥",
     "binding.update":        "修改模型用途绑定",
-    # 规则包（阶段 2 接入）
-    "rulepack.validate":     "校验规则包",
-    "rulepack.trial":        "试运行规则包",
-    "rulepack.activate":     "激活规则包",
-    "rulepack.disable":      "停用规则包",
-    "rulepack.rollback":     "回滚规则包",
-    "rulepack.ai_draft":     "AI 起草规则包",
+    # 可执行插件（阶段 2：dsh 风格，manifest + Python 判定代码）
+    # 这组动作替换了原先预声明的 rulepack.*（从未被任何代码写入过）。
+    # ai_draft / trial 是「不影响线上」的草稿期动作；activate 之后才是真生效。
+    "plugin.ai_draft":       "AI 起草插件",
+    "plugin.create":         "新建插件",
+    "plugin.update":         "编辑插件（新版）",
+    "plugin.validate":       "校验插件",
+    "plugin.trial":          "试跑插件",
+    "plugin.activate":       "启用插件",
+    "plugin.disable":        "停用插件",
+    "plugin.rollback":       "回滚插件版本",
+    "plugin.delete":         "删除插件",
+    # 下面两条由系统自己写（不是人在页面上点的），是运行期熔断与风险抬升的留痕：
+    #   auto_suspend —— 连续失败达阈值后自动停用，必须有据可查「哪来的插件不见了」
+    #   risk_raise   —— 插件把某船的 risk_level 抬了一级，是唯一能影响基线结论的路径
+    "plugin.auto_suspend":   "插件自动熔断",
+    "plugin.risk_raise":     "插件抬升风险等级",
     # 数据
     "data.upload":           "上传数据",
     "data.clean":            "清理数据",

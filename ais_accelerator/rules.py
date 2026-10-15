@@ -30,6 +30,21 @@ from .geometry import point_in_polygon  # 射线法多边形判断函数
 from .models import CandidateEvent, CandidateType, MatchedRule, ShipProfile  # 数据模型
 
 
+# 数据质量类事件的兜底规则：类型 → (规范码, 中文标签, 描述)
+# 这些事件没有区域可言，配不出区域规则，只能给一条不依赖区域的说明性规则。
+#
+# 【为什么是一张表而不是一个 if】原先这里把 AIS_GAP 与 POSITION_JUMP 一律挂上
+# violation_code="ais_off" 的规则。在旧目录里 ais_off 是"AIS异常关闭"的笼统码，
+# 看着没毛病；但本轮把 ais_off 精确成了"报文收到了、但导航要素整体不可用"，
+# 它从此是**另一个码**——再往 ais_gap 事件上挂 ais_off 规则，就等于把一个码的
+# 法规依据送给了另一个码，检索出来的法条与展示的类型对不上。
+_QUALITY_RULES: dict[CandidateType, tuple[str, str, str]] = {  # 事件类型 → (码, 标签, 描述)
+    CandidateType.AIS_GAP: ("ais_gap", "AIS信号中断", "AIS报文缺失：设备关闭或信号被遮蔽"),  # 时间上没收到
+    CandidateType.AIS_OFF: ("ais_off", "AIS导航要素不可用", "报文仍在发送，但位置/航向/航速整体不可用"),  # 收到了但没用
+    CandidateType.POSITION_JUMP: ("position_jump", "位置跳变异常", "相邻报文推算出的速度超出物理可能"),  # 数据跳变
+}
+
+
 class RuleProvider(Protocol):  # 规则提供器协议接口
     version: str  # 规则版本号
 
@@ -111,17 +126,16 @@ class JsonRuleProvider:  # 基于JSON文件的规则提供器
         zone = self.zone_by_id(event.zone_id or event.zone_name)  # 通过事件关联的区域ID查找区域
         if zone:  # 如果找到了区域
             selected.extend(self._zone_rules(event, zone))  # 添加该区域相关的规则
-        if event.candidate_type in {  # 如果事件类型是AIS信号缺失或位置跳变
-            CandidateType.AIS_GAP,
-            CandidateType.POSITION_JUMP,
-        }:
+        quality = _QUALITY_RULES.get(event.candidate_type)  # 数据质量类事件 → 兜底规则
+        if quality is not None:  # 如果这是质量类事件（无区域可配）
+            code, label, description = quality  # 解出规范码/标签/描述
             # violation_types 已迁移到 RegulationDB，此处使用默认标签
-            selected.append(  # 添加AIS异常关闭规则
+            selected.append(  # 添加该码自己的兜底规则
                 MatchedRule(
-                    rule_id="ais_off",  # 规则ID
-                    violation_code="ais_off",  # 违规代码
-                    label="AIS异常关闭",  # 规则标签
-                    description="故意关闭AIS信号试图逃避监控",  # 规则描述
+                    rule_id=code,  # 规则ID（与规范码同名，去重时不会互相顶掉）
+                    violation_code=code,  # 违规代码
+                    label=label,  # 规则标签
+                    description=description,  # 规则描述
                     source=self.path.name,  # 规则来源文件名
                     metadata={"rule_version": self.version},  # 规则版本元数据
                 )
@@ -150,8 +164,11 @@ class JsonRuleProvider:  # 基于JSON文件的规则提供器
                     speed_limit=float(restrictions["max_speed_knots"]),  # 限速值
                 )
             )
-        if (  # 如果事件是低速捕捞且该区域禁止捕鱼
-            event.candidate_type == CandidateType.LOW_SPEED_FISHING
+        if (  # 如果事件是禁渔区/禁渔期内的捕捞且该区域禁止捕鱼
+            # 这个码曾经对不上：detect 的禁渔区分支原先产 LOW_SPEED_FISHING
+            # （"低速捕捞嫌疑"，无区域判据），于是这条区域规则从来没被匹配过。
+            # 现在 detect 产 ILLEGAL_FISHING，两边才是同一个码。
+            event.candidate_type == CandidateType.ILLEGAL_FISHING
             and restrictions.get("fishing_allowed") is False
         ):
             time_rules = zone.get("time_rules", [])  # 区域的时间规则列表
@@ -169,16 +186,34 @@ class JsonRuleProvider:  # 基于JSON文件的规则提供器
         default_labels = {
             "restricted_area_entry": "禁航区入侵",
             "speed_violation": "超速行驶",
-            "illegal_fishing": "非法捕捞",
-            "ais_off": "AIS异常关闭",
+            "illegal_fishing": "违规捕捞",
+            "low_speed_fishing": "低速捕捞嫌疑",
+            "ais_gap": "AIS信号中断",
+            "ais_off": "AIS导航要素不可用",
+            "position_jump": "位置跳变异常",
             "collision_risk": "碰撞风险",
+            "overtaking_violation": "违规追越",
+            "give_way_failure": "让路船未让路",
+            "illegal_towing": "违规拖带/并靠",
+            "wrong_way_navigation": "逆向航行",
+            "anchoring_out_of_bounds": "越界锚泊",
+            "fairway_anchoring": "航道内锚泊",
         }
         default_descriptions = {
             "restricted_area_entry": "进入军事禁区或其他禁止进入区域",
             "speed_violation": "在限速区域超过规定航速",
             "illegal_fishing": "在禁渔区/禁渔期进行捕捞作业",
-            "ais_off": "故意关闭AIS信号试图逃避监控",
+            "low_speed_fishing": "开阔水域出现持续低速作业特征，涉嫌捕捞",
+            "ais_gap": "AIS报文缺失：设备关闭或信号被遮蔽",
+            "ais_off": "报文仍在发送，但位置/航向/航速整体不可用",
+            "position_jump": "相邻报文推算出的速度超出物理可能",
             "collision_risk": "船舶间存在碰撞危险，未按规定采取避碰措施",
+            "overtaking_violation": "追越他船时未按规定让路并保持安全横距",
+            "give_way_failure": "处于让路地位的船舶未按规定及早采取大幅避让行动",
+            "illegal_towing": "长时间极小间距同速同行，涉嫌违规拖带或并靠",
+            "wrong_way_navigation": "未按规定沿着分道通航制的船舶总流向行驶",
+            "anchoring_out_of_bounds": "在禁止锚泊的水域或锚地范围外锚泊",
+            "fairway_anchoring": "在船队航行走廊（航道）内锚泊，妨碍通航",
         }
         return MatchedRule(  # 返回匹配规则对象
             rule_id=f"{zone.get('id', zone.get('name'))}:{violation_code}",  # 规则ID：区域ID:违规代码
@@ -273,13 +308,32 @@ class RagRuleProvider:  # 基于RAG（向量检索）的规则提供器
 
     @staticmethod
     def _event_to_violation_code(event: CandidateEvent) -> Optional[str]:
-        """将候选事件类型映射为违规代码。"""
+        """将候选事件类型映射为规范违规码（供法规检索）。
+
+        值必须与 `violation_catalog.CANONICAL` 的码一致，否则检索口径与
+        最终展示的 `violation_code` 会对不上（同一个行为查出另一类法规）。
+        """
         mapping = {
             CandidateType.RESTRICTED_AREA_ENTRY: "restricted_area_entry",
+            CandidateType.ANCHORING_OUT_OF_BOUNDS: "anchoring_out_of_bounds",
+            CandidateType.FAIRWAY_ANCHORING: "fairway_anchoring",
             CandidateType.SPEED_VIOLATION: "speed_violation",
-            CandidateType.LOW_SPEED_FISHING: "illegal_fishing",
-            CandidateType.AIS_GAP: "ais_off",
-            CandidateType.POSITION_JUMP: "ais_off",
+            CandidateType.OVERTAKING_VIOLATION: "overtaking_violation",
+            CandidateType.GIVE_WAY_FAILURE: "give_way_failure",
+            CandidateType.ILLEGAL_TOWING: "illegal_towing",
+            CandidateType.WRONG_WAY_NAVIGATION: "wrong_way_navigation",
+            # 下面几项是旧口径的订正：catalog 里 ais_gap 与 ais_off、
+            # low_speed_fishing 与 illegal_fishing 是**两个不同的码**，
+            # 原先一律映射到后者，检索到的法规与展示的类型不是一回事。
+            # 注意 AIS_OFF 是"报到但内容不可用"，与 AIS_GAP 的法规依据不同，
+            # 不能顺手映射到 ais_gap（那样两个码会查出同一批法规）。
+            CandidateType.LOW_SPEED_FISHING: "low_speed_fishing",
+            CandidateType.ILLEGAL_FISHING: "illegal_fishing",
+            CandidateType.AIS_GAP: "ais_gap",
+            CandidateType.AIS_OFF: "ais_off",
+            CandidateType.POSITION_JUMP: "position_jump",
+            # 原先缺这一项 → 返回 None → 碰撞风险事件查不到任何法规
+            CandidateType.COLLISION_RISK: "collision_risk",
             CandidateType.COURSE_ANOMALY: None,  # 航向异常暂无直接对应
         }
         return mapping.get(event.candidate_type)

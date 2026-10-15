@@ -11,7 +11,7 @@ ais_accelerator/models.py — 数据模型定义（Pydantic 合约）
   - ShipProfile: 船舶概要（MMSI/名称/类型/尺寸）
   - QualityReport: 质量评估报告（重复点/无效点/异常标记）
   - TrajectorySegment: 轨迹分段（按时间/区域切割后的连续段）
-  - CandidateEvent: 候选事件（超速/捕捞/禁航等 6 种类型）
+  - CandidateEvent: 候选事件（超速/捕捞/禁航等 15 种类型，见 CandidateType）
   - MatchedRule: 命中的规则（来自 regulations.json）
   - CandidatePackage: 加速器→Agent 的最终输出包
   - AnnotatedTrack: 打标记模式下的完整轨迹输出（含特征向量）
@@ -47,7 +47,7 @@ class TagSeverity(str, Enum):  # 标记严重程度枚举
 
 class AnnotationTag(BaseModel):  # 对单个AIS点或点区间的标记
     """对单个AIS点或点区间的标记"""
-    type: str = Field(description="标记类型: speed_violation|low_speed_fishing|restricted_area_entry|ais_gap|position_jump|course_anomaly|data_quality|rule_hit|segment_boundary|key_point")  # 标记类型
+    type: str = Field(description="标记类型: 事件类标记与 CandidateType 同名（全部取值见 models.CandidateType，勿在此处另行罗列——罗列过就会过期），另有 data_quality|rule_hit|segment_boundary|key_point 等非事件标记")  # 标记类型
     label: str = Field(description="中文描述")  # 中文标签描述
     detail: dict = Field(default_factory=dict, description="详细信息")  # 详细信息字典
     confidence: float = Field(default=0.0, ge=0, le=1, description="加速器自评置信度")  # 置信度（0~1）
@@ -66,11 +66,19 @@ class QualitySeverity(str, Enum):  # 质量问题的严重程度枚举
 class CandidateType(str, Enum):  # 候选事件类型枚举
     RESTRICTED_AREA_ENTRY = "restricted_area_entry"  # 进入禁航区
     SPEED_VIOLATION = "speed_violation"  # 超速违规
-    LOW_SPEED_FISHING = "low_speed_fishing"  # 低速捕捞嫌疑
-    AIS_GAP = "ais_gap"  # AIS信号缺失
+    LOW_SPEED_FISHING = "low_speed_fishing"  # 低速捕捞嫌疑（开阔水域作业特征）
+    ILLEGAL_FISHING = "illegal_fishing"  # 违规捕捞（禁渔区/禁渔期内的法定违规）
+    AIS_GAP = "ais_gap"  # AIS信号缺失（时间上没收到报文）
+    AIS_OFF = "ais_off"  # AIS导航要素不可用（收到了报文但内容整体不可用）
     COURSE_ANOMALY = "course_anomaly"  # 航向异常
     POSITION_JUMP = "position_jump"  # 位置跳变
-    COLLISION_RISK = "collision_risk"  # 碰撞风险
+    COLLISION_RISK = "collision_risk"  # 碰撞风险（风险状态）
+    OVERTAKING_VIOLATION = "overtaking_violation"  # 违规追越（多船，COLREG 第13条）
+    GIVE_WAY_FAILURE = "give_way_failure"  # 让路船未让路（多船，COLREG 第15/16/17条）
+    WRONG_WAY_NAVIGATION = "wrong_way_navigation"  # 逆向航行（航向场）
+    ANCHORING_OUT_OF_BOUNDS = "anchoring_out_of_bounds"  # 越界锚泊（区域锚地判定）
+    FAIRWAY_ANCHORING = "fairway_anchoring"  # 航道内锚泊（数据驱动航道走廊）
+    ILLEGAL_TOWING = "illegal_towing"  # 违规拖带/并靠（多船，长时间极小间距同速同行）
 
 
 class QualityIssue(BaseModel):  # 质量问题记录模型
@@ -89,6 +97,11 @@ class AISPoint(BaseModel):  # 单个AIS数据点模型
     speed: float  # 航速（节）
     course: float  # 航向（度）
     status: Optional[str] = None  # 船舶状态
+    # AIS 报文里的船型码（VesselType）。放在**点上**而不是只放在 ShipProfile 上，
+    # 是因为检测器拿到的是 TrajectorySegment（只有 mmsi + points），
+    # 把船型挂在点上可以不动任何检测器签名就让它可用。
+    # 语义上它是**船级**属性、逐点重复，与已有的 status 处理方式一致。
+    vessel_type: Optional[str] = None  # 船型码（如 30=Fishing / 1001=Commercial Fishing）
     quality_flags: List[str] = Field(default_factory=list)  # 质量标记列表
     tags: List[str] = Field(default_factory=list, description="人类可读的标记列表，如['疑似超速(v1)','最高速度']")  # 人类可读的标记标签列表
 
@@ -228,6 +241,10 @@ class PipelineMetrics(BaseModel):  # 管线处理指标模型
     estimated_compressed_characters: int = 0  # 估计的压缩后字符数
     cache_hits: int = 0  # 缓存命中次数
     agent_calls: int = 0  # Agent调用次数
+    collision_events: int = 0  # 多船碰撞风险事件数（pipeline 累加）
+    overtaking_events: int = 0  # 多船违规追越事件数（同上）
+    give_way_events: int = 0  # 多船让路船未让路事件数（同上）
+    towing_events: int = 0  # 多船违规拖带/并靠事件数（同上）
     ingest_seconds: float = 0.0  # 数据导入耗时（秒）
     preprocessing_seconds: float = 0.0  # 预处理耗时（秒）
     agent_seconds: float = 0.0  # Agent推理耗时（秒）

@@ -60,6 +60,12 @@
                     </span>
                   </div>
                 </div>
+                <!-- 造插件回复：给一个直达草稿的按钮。
+                     造完之后用户的下一步必然是去试跑/启用它，让他自己去翻菜单
+                     找不到入口的话，这个功能等于没做。 -->
+                <button v-if="m.forge" class="forge-link" @click="goDraft(m.forge)">
+                  <AppIcon name="puzzle" inline /> 查看草稿「{{ m.forge.label }}」→
+                </button>
                 <span v-if="m.exp" class="bubble-exp">+{{ m.exp }} exp</span>
               </div>
               <span v-if="m.role === 'user'" class="ai-avatar sm you">{{ userName }}</span>
@@ -211,7 +217,7 @@
     <button class="ai-fab" title="智能体" @pointerdown="dragFab">
       <span class="fab-ico">
         <img v-if="avatarIsImage" :src="aiConfig.avatar" alt="avatar" />
-        <AppIcon v-else :name="aiConfig.avatar" :size="19" />
+        <AppIcon v-else :name="aiConfig.avatar" :size="18" />
       </span>
       <span class="fab-label">智能体</span>
       <span v-if="status.interaction_count" class="fab-badge">{{ status.interaction_count }}</span>
@@ -222,6 +228,7 @@
 
 <script setup>
 import { ref, reactive, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { aiConfig, updateAiProfile, isImageUrl } from '../store/ai.js'
 import { user } from '../store/user.js'
 import { sendChat, fetchTools } from '../api/ai.js'
@@ -232,7 +239,20 @@ import RenderBlocks from './RenderBlocks.vue'
 
 const avatarIsImage = computed(() => isImageUrl(aiConfig.avatar))
 
-const FAB_W = 104
+// 造插件成功后跳到开发者页的插件分区，并带上插件 id。
+// 光跳到列表不够 —— 插件多了以后用户还得自己找，入口等于没做顺；
+// DevPlugins 会据 plugin 参数把它滚到眼前并高亮。
+const router = useRouter()
+function goDraft(forge) {
+  open.value = false
+  router.push({
+    path: '/dev',
+    query: { tab: 'plugins', ...(forge?.plugin_id ? { plugin: forge.plugin_id } : {}) }
+  })
+}
+
+// 同 FloatingBall：别手写死宽度，挂载时按 DOM 实量，两个球的右边才对齐
+let FAB_W = 104
 const FAB_H = 48
 const BASE_W = 380
 
@@ -297,14 +317,21 @@ const windowScale = computed(() => clamp(pos.width / BASE_W, 0.75, 1.6))
 
 function clamp(v, min, max) { return Math.min(Math.max(v, min), max) }
 
+// v2：窗口从 400×540 收到 400×500。只减高度是因为它本来高得空 —— 而宽度一收，
+// 底部那排建议词就从 2 行挤成 3 行，反而更乱。换 key 是因为老 key 里存的就是旧默认值
+// 本身，沿用旧 key 的话所有老用户都还是 540，改了等于没改。
+const POS_KEY = 'ai-float-pos-v2'
+const DEF_W = 400
+const DEF_H = 500
+
 function loadPos() {
   let saved = null
-  try { saved = JSON.parse(localStorage.getItem('ai-float-pos') || 'null') } catch (e) {}
-  return { left: 0, top: 0, width: saved?.width || 400, height: saved?.height || 540 }
+  try { saved = JSON.parse(localStorage.getItem(POS_KEY) || 'null') } catch (e) {}
+  return { left: 0, top: 0, width: saved?.width || DEF_W, height: saved?.height || DEF_H }
 }
 
 function savePos() {
-  try { localStorage.setItem('ai-float-pos', JSON.stringify({ width: pos.width, height: pos.height })) } catch (e) {}
+  try { localStorage.setItem(POS_KEY, JSON.stringify({ width: pos.width, height: pos.height })) } catch (e) {}
 }
 
 function fmtTime(t) {
@@ -442,7 +469,7 @@ async function send() {
   try {
     const r = await sendChat({ message: t, user_id: userId.value })
     const reply = r.reply || '抱歉，我暂时无法回答。'
-    messages.value.push({ role: 'ai', content: reply, exp: r.exp_gained, tools: r.tool_calls || [], structured: r.structured || null, blocks: r.blocks || null })
+    messages.value.push({ role: 'ai', content: reply, exp: r.exp_gained, tools: r.tool_calls || [], structured: r.structured || null, blocks: r.blocks || null, forge: r.forge || null })
     if (r.growth_event) messages.value.push({ role: 'ai', content: r.growth_event, meta: true })
     if (r.exp_gained) {
       newExp.value = r.exp_gained
@@ -508,6 +535,8 @@ async function savePrefs() {
 }
 
 onMounted(() => {
+  const fabEl = document.querySelector('.ai-fab')
+  if (fabEl) FAB_W = fabEl.getBoundingClientRect().width
   pos.left = Math.max(0, window.innerWidth - FAB_W - 16)
   pos.top = 140
   nameInput.value = aiConfig.name
@@ -528,27 +557,30 @@ onUnmounted(() => {
 
 <style scoped>
 .ai-float { position: fixed; z-index: 10001; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+/* 几何量（边框/内边距/gap/图标盒/标签字号/徽章）刻意和 FloatingBall 的
+   .cascade-fab 保持一致：两个球上下叠在一起，谁差一档都会显得参差。
+   徽章用 min-width + 圆角矩形而不是固定 20px 圆 —— 「121」这种三位数才不会被挤扁。 */
 .ai-fab {
-    position: relative; display: flex; align-items: center; gap: 7px;
+    position: relative; display: flex; align-items: center; gap: 6px;
     background: rgba(15, 26, 46, 0.88);
     backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
-    border: 1px solid rgba(26,115,232,0.65); color: #fff;
-    padding: 6px 15px 6px 10px; border-radius: 999px; cursor: grab;
+    border: 2px solid rgba(26,115,232,0.65); color: #fff;
+    padding: 6px 14px 6px 10px; border-radius: 999px; cursor: grab;
     font-size: 14px; user-select: none; touch-action: none;
     box-shadow: 0 8px 26px rgba(10,20,45,0.55);
     transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
 .ai-fab:hover { transform: translateY(-2px) scale(1.04); box-shadow: 0 12px 30px rgba(26,115,232,0.45); }
 .ai-fab:active { cursor: grabbing; transform: scale(1.02); }
-.fab-ico { font-size: 19px; line-height: 1; width: 22px; height: 22px; flex-shrink: 0; }
+.fab-ico { font-size: 18px; line-height: 1; width: 18px; height: 18px; flex-shrink: 0; }
 .fab-ico img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; display: block; }
-.fab-label { font-weight: 600; letter-spacing: 1px; font-size: 13px; }
+.fab-label { font-weight: 600; letter-spacing: 0.5px; font-size: 13px; }
 .fab-badge {
-    position: absolute; top: -7px; right: -7px;
+    position: absolute; top: -6px; right: -6px;
     background: linear-gradient(135deg, #1a73e8, #7c3aed);
     color: #fff; min-width: 20px; height: 20px; border-radius: 10px;
     display: flex; align-items: center; justify-content: center;
-    padding: 0 5px; font-size: 10px; font-weight: 700; border: 2px solid #fff;
+    padding: 0 5px; font-size: 11px; font-weight: 700; border: 2px solid #fff;
 }
 .fab-exp {
     position: absolute; left: 50%; transform: translateX(-50%);
@@ -580,7 +612,9 @@ onUnmounted(() => {
     color: #e8f0fe;
 }
 .ai-window-header {
-    display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+    /* 必须换行：标题和 4 个 tab 挤不进同一行（见下面 .hdr-tabs 的说明） */
+    display: flex; flex-wrap: wrap; align-items: center;
+    gap: 6px 10px; padding: 9px 12px;
     background: rgba(26,115,232,0.16);
     border-bottom: 1px solid rgba(255,255,255,0.1);
     cursor: grab; user-select: none; touch-action: none;
@@ -597,11 +631,22 @@ onUnmounted(() => {
 .ai-avatar:not(.sm) { border: 1px solid rgba(26,115,232,0.5); }
 .ai-avatar.sm { width: 26px; height: 26px; font-size: 13px; }
 .ai-avatar.you { background: rgba(124,58,237,0.35); }
+/* 标题吃掉第 1 行的剩余宽度。tab 移到第 2 行后这里有 ~297px，
+   两行都能完整显示；行高收紧是为了让整个头部不至于撑太高。 */
 .ai-window-title { flex: 1; min-width: 0; }
-.ai-window-title strong { font-size: 13px; display: block; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.ai-window-title small { font-size: 11px; opacity: 0.55; color: #b9c6dd; white-space: nowrap; }
+.ai-window-title strong { font-size: 13px; line-height: 1.35; display: block; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* small 也加溢出保护：它原来只有 nowrap，父盒一旦变窄就整条溢出去压到 tab 上 */
+.ai-window-title small { font-size: 11px; line-height: 1.35; opacity: 0.55; color: #b9c6dd; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
 
-.hdr-tabs { display: flex; gap: 2px; }
+/* tab 独占一行。原来它和标题同行：4 个 tab 常驻 237px，而标题的基准宽度是 0
+   （.ai-window-title 写了 flex: 1，即 flex-basis: 0），400px 的窗口里只剩 50px
+   —— strong 被截成「智能…」，small 那 194px 更是整条溢出、压到 tab 上。
+   移动端布局本来就是这么分的（见文末媒体查询），这里提到基础样式。 */
+.hdr-tabs {
+    order: 5; width: 100%; display: flex; gap: 2px;
+    border-top: 1px solid rgba(255,255,255,0.1);
+    margin-top: 1px; padding-top: 6px;
+}
 .hdr-tab {
     background: none; border: none; color: rgba(255,255,255,0.6);
     padding: 4px 8px; border-radius: 7px; font-size: 12px; cursor: pointer;
@@ -638,6 +683,15 @@ onUnmounted(() => {
     font-size: 12px; padding: 5px 12px; color: #c4b5fd; max-width: 100%;
 }
 .bubble-exp { display: inline-flex; align-items: center; gap: 4px; margin-left: 6px; font-size: 11px; color: #7ee787; font-weight: 700; }
+/* 造插件回复里的「查看草稿」—— 用主色描边引出，与工具调用记录的灰色块区分开 */
+.forge-link {
+  display: flex; align-items: center; gap: 6px; width: 100%; margin-top: 9px;
+  padding: 8px 12px; border-radius: 8px; cursor: pointer;
+  font-size: 12.5px; font-weight: 600; text-align: left;
+  color: #7cc4ff; background: rgba(26, 115, 232, 0.16);
+  border: 1px solid rgba(26, 115, 232, 0.45); transition: all 0.15s;
+}
+.forge-link:hover { background: rgba(26, 115, 232, 0.3); color: #a9d6ff; }
 
 /* ── 对话中的工具调用卡片 ── */
 .tool-calls { display: flex; flex-direction: column; gap: 5px; margin-top: 8px; border-top: 1px dashed rgba(255,255,255,0.14); padding-top: 7px; }
@@ -824,10 +878,7 @@ onUnmounted(() => {
         min-width: 0 !important; min-height: 0 !important;
         border-radius: 16px 16px 0 0 !important;
     }
-    .ai-float.is-mobile .ai-window-header { flex-wrap: wrap; row-gap: 4px; }
-    .ai-float.is-mobile .hdr-tabs {
-        order: 5; width: 100%; justify-content: center;
-        border-top: 1px solid rgba(255,255,255,0.1); padding-top: 4px;
-    }
+    /* 换行、tab 独占一行已提升为基础样式，移动端只多一个居中 */
+    .ai-float.is-mobile .hdr-tabs { justify-content: center; }
 }
 </style>

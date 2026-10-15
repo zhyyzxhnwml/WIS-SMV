@@ -43,6 +43,117 @@ except ImportError:  # 导入失败
 # [诊断用] 让初始化是否成功、失败在哪一步，直接打到标准输出（run.py 的 stdout 会透传到前端日志）
 _LLM_DIAG = True
 
+# 违规类型词表（惰性构建 + 缓存）。从目录生成而不是在 prompt 里手抄：
+# 手抄一份就等于留了第二个真相源，目录一改 prompt 就悄悄过期——
+# 而我们正在修的就是"LLM 自创违规码"这类词汇表漂移。
+_VIOLATION_VOCAB_CACHE: Optional[str] = None
+
+# ── 实测证据渲染（本模块唯一真正决定"LLM 判不判得准"的东西）────────────
+# 【为什么要有这一段】旧版的 `_summarize_events` 只输出 `[priority] 类型 @ 区域`，
+# **把 `ev["features"]` 整个丢掉了** —— 而那正是 `violation_catalog.
+# deterministic_violation()` 用来定违规的量值（DCPA、实测间距、速差、超速比例）。
+# 同理 `_summarize_rules` 只给 label，不给量值；`feature_metadata` 只用了时长，
+# 平均/最高航速丢掉；23 维窗口特征（含 min_sep_nm）**一个字都没进过 prompt**。
+# 结果是：我们问 LLM"这条船违不违规"，却把它据以回答的**数字全部删掉了**，
+# 然后再拿"LLM 判定 lift 0.88"当它不行的证据。那不是模型的能力上限，
+# 是我们自己管线造出来的信息瓶颈。
+#
+# 渲染顺序 = token 预算的分配顺序。排前面的是**判性依据**（与 PROMOTABLE 的
+# 门槛字段同源），排后面的是上下文；超预算时先丢上下文，不丢判据。
+_EV_FIELDS: tuple[tuple[str, str, str], ...] = (
+    ("dcpa_nm", "最近会遇距离DCPA", "海里"),
+    ("min_separation_nm", "实测最小间距", "海里"),
+    ("give_way_close_quarters_nm", "让路紧迫局面距离", "海里"),
+    ("tcpa_minutes", "到最近会遇时间TCPA", "分"),
+    ("cri", "碰撞危险度CRI", ""),
+    ("max_speed_diff_knots", "追越最大速差", "节"),
+    ("speed_diff_knots", "速差", "节"),
+    ("speed_over_ratio", "超速比例", ""),
+    ("max_speed", "最高速", "节"),
+    ("average_speed", "平均速", "节"),
+    ("speed_limit", "区域限速", "节"),
+    ("reference_speed", "参照主流速", "节"),
+    ("gap_minutes", "信号缺失时长", "分"),
+    ("duration_minutes", "事件持续", "分"),
+    ("anchoring_duration_minutes", "锚泊时长", "分"),
+    ("course_change_degrees", "航向变化", "度"),
+    ("course_rate_degrees_per_minute", "转向率", "度/分"),
+    ("distance_nm", "两船距离", "海里"),
+    ("relative_speed", "相对速度", "节"),
+    ("relative_bearing", "相对方位", "度"),
+    ("target_mmsi", "目标船MMSI", ""),
+    ("elapsed_minutes", "历时", "分"),
+    ("minimum_speed", "最低速", "节"),
+    ("prior_median_speed", "此前后中位速", "节"),
+    ("low_speed_threshold", "低速判定线", "节"),
+    ("anchoring_speed_threshold", "锚泊速度线", "节"),
+    ("point_count", "证据点数", "个"),
+    ("merged_event_count", "合并事件数", "个"),
+    ("judge", "检测器判定", ""),
+    ("risk_level", "检测器风险档", ""),
+    ("in_corridor", "在航道走廊内", ""),
+    ("in_zone", "在区域内", ""),
+)
+_EV_MAX_FIELDS = 14   # 单事件最多渲染几个量值（按上表顺序取前 N 个）
+_EV_MAX_EVENTS = 5    # 最多渲染几个事件（按严重度排序后）
+_PRIO_RANK = {"high": 0, "middle": 1, "low": 2}
+
+# 窗口特征渲染：23 维全给太长，只给**有信息量**的（"最长的一天最危险的那个窗"）。
+# 全零/全 NaN 的维度（例如当天无他船时的 min_sep 退化为 NOBODY_NM）不占 token。
+_WIN_LABELS = {
+    "sog_mean": "窗内平均速(节)", "sog_std": "速标准差", "sog_min": "最低速(节)",
+    "sog_max": "最高速(节)", "dsog_mean": "平均加速度(节/步)", "dsog_max": "最大加速度",
+    "cog_circstd": "航向圆标准差(度)", "turn_mean": "平均转向(度)",
+    "turn_max": "最大转向(度)", "turnrate_max": "最大转向率(度/分)",
+    "turn_net": "净转向(度)", "path_len": "路径长(海里)", "net_disp": "净位移(海里)",
+    "straightness": "直线度", "n_points": "点数", "interval": "采样间隔(秒)",
+    "disp_rate_mean": "平均位移率", "disp_rate_std": "位移率标准差",
+    "cog_sin": "航向正弦", "cog_cos": "航向余弦",
+    "min_sep_nm": "最近会遇距离(海里)", "sep_p5_nm": "会遇距离5分位(海里)",
+    "frac_within_1nm": "1海里内占比",
+}
+
+
+def _num(v: Any) -> str:
+    """数值 → 紧凑可读串（bool 走中文，避免 prompt 里出现 True/False 混排）。"""
+    if isinstance(v, bool):
+        return "是" if v else "否"
+    if isinstance(v, (int, float)):
+        f = float(v)
+        if f != f or f in (float("inf"), float("-inf")):
+            return str(v)
+        if f == int(f) and abs(f) < 1e9:  # 24.0 → "24"（点数/条数这类整数量值）
+            return str(int(f))
+        if abs(f) >= 100:
+            return f"{f:.0f}"
+        if abs(f) >= 10:
+            return f"{f:.1f}"
+        return f"{f:.3f}".rstrip("0").rstrip(".")
+    return str(v)
+
+
+def violation_vocab() -> str:
+    """渲染违规类型词表，供 prompt 的 {violation_vocab} 占位符填充。"""
+    global _VIOLATION_VOCAB_CACHE
+    if _VIOLATION_VOCAB_CACHE is not None:
+        return _VIOLATION_VOCAB_CACHE
+    try:
+        from ais_accelerator.violation_catalog import CANONICAL, CATEGORY_MAP
+        lines = []
+        for code, info in CANONICAL.items():
+            if code == "unknown":
+                continue  # 兜底码放最后单独说明，不混在可选列表里
+            cat = CATEGORY_MAP.get(info.get("category", ""), info.get("category", ""))
+            lines.append(f"- {code}：{info.get('label', '')}（{cat}）")
+        lines.append("- unknown：其他违规（无法归入以上任何一类时才用）")
+        _VIOLATION_VOCAB_CACHE = "\n".join(lines)
+    except Exception as e:  # noqa: BLE001 — 词表拿不到不该让判定整个失败
+        # 不静默降级成空串：那等于把"LLM 自创违规码"的老问题原样放回来，
+        # 而且现场看不出任何痕迹。宁可吵一声。
+        print(f"    ⚠ 违规类型词表构建失败，prompt 将不含可选值约束: {e}")
+        _VIOLATION_VOCAB_CACHE = ""
+    return _VIOLATION_VOCAB_CACHE
+
 
 def _quality_level_of(qr: dict) -> str:
     """从质量报告的 issues 推导综合质量等级（good/fair/poor）。
@@ -348,7 +459,17 @@ class LLMHandler:
         avg_conf = sum(confidences) / len(confidences) if confidences else 0  # 计算平均置信度
 
         # 时间范围
-        start_time = feature_meta.get("total_duration_minutes", "?")  # 轨迹起始时间（或总时长）
+        # 旧版把 `start_time` 绑在 `total_duration_minutes` 上（那是**时长**，不是时刻），
+        # 而 `end_time=start_time` —— 注释自己都写了"实际应取最后一个点的时间"。
+        # 于是 prompt 里写的是"从 340 到 340 的完整轨迹"。时刻是可核对的量，
+        # 而这里是唯一提供它的地方（轨迹 JSON 里的 timestamp 被 8000 字符截断，
+        # 长轨迹的首尾根本进不了 prompt）。取首末点，退化时才回落到时长。
+        times = [str(p.get("timestamp")) for p in track_points if p.get("timestamp")]
+        if times:
+            start_time, end_time = times[0][:19].replace("T", " "), times[-1][:19].replace("T", " ")
+        else:
+            _dur = feature_meta.get("total_duration_minutes")
+            start_time = end_time = f"未知（时长 {_num(_dur)} 分钟）" if _dur else "?"
         point_count = len(track.get("track", []))  # 轨迹点总数
 
         has_annotations = "是" if annotations else "否"  # 是否有标记的文本表示
@@ -356,45 +477,252 @@ class LLMHandler:
         # 法规上下文（从 track 中提取，由 orchestrator 注入）
         regulation_context = track.get("_regulation_context", "")  # 法规上下文文本
 
+        # ── 补回判性所需的证据（见模块头 _EV_FIELDS 的说明）──
+        # 这些量值原先全部不在 prompt 里：事件量值被 _summarize_events 丢掉、
+        # 23 维窗口特征从未注入、航速统计只用了时长。三条各自独立缺失，
+        # 合起来就是"让 LLM 蒙着眼睛判违规"。
+        measured = [
+            f"【L1 实测事件】\n{event_summary}",
+            f"【L1 硬证据核对】\n{self._hard_evidence_line(events)}",
+            f"【L1 规则命中】\n{rule_hits}",
+            f"【本船当天最危险窗口的窗口特征】\n{self._summarize_window(track.get('window_features'))}",
+            f"【本船航速/时长统计】\n{self._summarize_stats(feature_meta)}",
+        ]
+        measured_evidence = "\n".join(measured)
+        triage_context = self._summarize_triage(routing)
+
         return template.format(
             event_summary=event_summary,  # 事件摘要内容
             annotation_confidence=f"{avg_conf:.2%}",  # 平均置信度（百分比格式）
             rule_hits=rule_hits,  # 规则命中摘要
+            measured_evidence=measured_evidence,  # 实测证据块（事件量值+窗口特征+速度）
+            triage_context=triage_context,  # L2 风险分与门控依据
             regulation_context=regulation_context,  # 法规上下文
             track_data=track_data[:8000],  # 轨迹JSON数据（截断到8000字符）
             annotations=annotations_text[:3000],  # 标记明细（截断到3000字符）
             similar_cases=similar_text,  # 相似案例文本
             similar_count=similar_count,  # 相似案例数量
-            start_time=start_time,  # 开始时间
-            end_time=start_time,  # 结束时间（实际应取最后一个点的时间）
+            start_time=start_time,  # 开始时间（首点时刻）
+            end_time=end_time,  # 结束时间（末点时刻）
             point_count=point_count,  # 轨迹点总数
             has_annotations=has_annotations,  # 是否有标记
             quality_summary=quality_summary,  # 数据质量摘要
+            # 违规类型可选值。只有三个模板带这个占位符；quick_verify 的模板里
+            # 没有它，多传一个未使用的 kwarg 对 str.format 是安全的（会被忽略）。
+            violation_vocab=violation_vocab(),
         )
 
     def _summarize_events(self, events: list[dict]) -> str:
-        """生成事件摘要字符串"""
+        """事件摘要：**类型 + 区域 + L1 实测到的量值**。
+
+        旧版只给 `[priority] 类型 @ 区域`，把 `features` 丢了 —— 于是 LLM 永远
+        看不到"最近会遇 0.09 海里"这类判性依据。这里补回来，并按严重度排序后
+        截断（`deterministic_violation` 取的是最严重的那类，前 3 条按原始顺序取
+        很可能正好把决定性事件排在窗口外）。
+        """
         if not events:  # 无事件
             return "未检测到候选事件"  # 返回默认信息
-        summaries = []  # 事件摘要列表（初始化为空列表）
-        for ev in events[:3]:  # 遍历前3个事件
+        ranked = sorted(  # 严重度高在前；同级保持原始顺序（sorted 稳定）
+            enumerate(events),
+            key=lambda kv: _PRIO_RANK.get(str(kv[1].get("priority") or "middle"), 1),
+        )
+        summaries = []
+        for _, ev in ranked[:_EV_MAX_EVENTS]:
             etype = ev.get("candidate_type", ev.get("type", "unknown"))  # 事件类型
-            zone = ev.get("zone_name") or ev.get("zone_id", "未知区域")  # 事件所在区域
+            # `ev.get("zone_id", 默认)` 在**键存在但值为 None** 时返回 None，
+            # 于是 prompt 里印出 "@ None"（实测）。逐级 or 兜到底。
+            zone = ev.get("zone_name") or ev.get("zone_id") or "未知区域"
             priority = ev.get("priority", "middle")  # 事件优先级
-            summaries.append(f"[{priority}] {etype} @ {zone}")  # 添加单条摘要
-        if len(events) > 3:  # 事件数超过3个
-            summaries.append(f"... 还有 {len(events) - 3} 个事件")  # 超出3个的事件数量汇总
-        return "; ".join(summaries)  # 用分号连接所有摘要
+            feats = ev.get("features") or {}
+            vals = self._render_measurements(feats)
+            span = self._event_span(ev)
+            line = f"[{priority}] {etype} @ {zone}{span}"
+            if vals:
+                line += f" —— 实测量值: {vals}"
+            summaries.append(line)
+        if len(events) > _EV_MAX_EVENTS:  # 事件数超出渲染上限
+            summaries.append(f"... 还有 {len(events) - _EV_MAX_EVENTS} 个事件")
+        return "\n".join(summaries)  # 一行一个事件（量值多，分号连会糊成一团）
+
+    @staticmethod
+    def _event_span(ev: dict) -> str:
+        """事件的起止时间（有就给，没有就空）。"""
+        s, e = ev.get("start_time") or ev.get("start"), ev.get("end_time") or ev.get("end")
+        s, e = (str(s)[11:16] if s else ""), (str(e)[11:16] if e else "")
+        return f" {s}~{e}" if s and e else ""
+
+    @staticmethod
+    def _render_measurements(feats: dict) -> str:
+        """事件 features → `中文名=值单位` 列表（按 _EV_FIELDS 的判据优先序）。"""
+        if not isinstance(feats, dict) or not feats:
+            return ""
+        seen = set()
+        out = []
+        for key, label, unit in _EV_FIELDS:
+            if key not in feats or feats[key] is None:
+                continue
+            seen.add(key)
+            out.append(f"{label}={_num(feats[key])}{unit}")
+            if len(out) >= _EV_MAX_FIELDS:
+                break
+        if len(out) < _EV_MAX_FIELDS:  # 表外字段兜底（目录新加了量值也不至于丢）
+            for key, v in feats.items():
+                if key in seen or v is None or isinstance(v, (dict, list)):
+                    continue
+                out.append(f"{key}={_num(v)}")
+                if len(out) >= _EV_MAX_FIELDS:
+                    break
+        return "，".join(out)
 
     def _summarize_rules(self, annotations: list[dict]) -> str:
-        """生成规则命中摘要字符串"""
+        """规则命中摘要：**label + 码 + 该规则实际测到的量值**。
+
+        旧版只印 label，于是"命中规则: 违规追越"到 LLM 眼里等于没有依据 ——
+        追越的门槛是速差 ≥5 节，而那个速差就在 `detail` 里，原样丢掉了。
+        """
         rules = [a for a in annotations if a.get("type") == "rule_hit"]  # 提取所有规则命中类型的标记
         if not rules:  # 无命中规则
             return "无命中规则"  # 返回默认信息
-        return "; ".join(  # 用分号连接前5条规则命中的标签
-            f"{r.get('label', r.get('violation_code', '?'))}"  # 获取规则标签或违规代码
-            for r in rules[:5]  # 遍历前5条规则
+        lines = []
+        for r in rules[:5]:
+            name = r.get("label") or r.get("violation_code") or "?"
+            code = r.get("violation_code") or ""
+            det = r.get("detail") or {}
+            # `detail` 里既有**实测量值**也有元数据（rule_id/zone_id/zone_name/
+            # violation_code/description …）。元数据对判性无用却占 token ——
+            # 实测把整份 detail 灌进去，prompt 里出现的是
+            # "rule_id=ais_gap，violation_code=ais_gap，zone_id=None，…"，
+            # 而真正该看的量值一个都没有。这里只留数值型与简短文本。
+            _META = {"rule_id", "zone_id", "zone_name", "violation_code",
+                     "source", "validity_status", "speed_limit",
+                     "event_id", "segment_id"}
+            bits, texts = [], []
+            for k, v in det.items():
+                if k in _META or v is None or isinstance(v, (dict, list)):
+                    continue
+                if isinstance(v, (bool, int, float)):
+                    bits.append(f"{k}={_num(v)}")
+                elif isinstance(v, str) and len(v) <= 60:
+                    texts.append(f"{k}={v}")
+            bits = (bits + texts)[:6]
+            line = f"{name}" + (f"（{code}）" if code and code != name else "")
+            if bits:
+                line += "：实测量值 " + "，".join(bits)
+            desc = det.get("description")
+            if isinstance(desc, str) and desc and not bits:
+                line += f"：{desc[:60]}"
+            conf = r.get("confidence")
+            if isinstance(conf, (int, float)):
+                line += f"（置信度 {_num(conf)}）"
+            lines.append(line)
+        if len(rules) > 5:
+            lines.append(f"... 另有 {len(rules) - 5} 条规则命中")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _summarize_window(win: Any) -> str:
+        """23 维窗口特征（该船当天**最危险那个 20 分钟窗**的 max 聚合）。
+
+        生产入参是 `entry["window_features"]`（run.py 用 window_feat.named() 具名化）。
+        旧版这一整块**从未进过 prompt**，而它恰恰是 L2 模型最依赖的输入
+        （`min_sep_nm` = 与最近他船的实测会遇距离，违规就住在两船的关系里）。
+        """
+        if not win:
+            return "未算出（该船当天点数不足以凑满 20 分钟窗）"
+        items = win.items() if isinstance(win, dict) else enumerate(win)
+        out = []
+        for k, v in items:
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if f != f:  # NaN = 当天无他船可比 → 不占 token
+                continue
+            out.append(f"{_WIN_LABELS.get(str(k), str(k))}={_num(f)}")
+        return "，".join(out) if out else "无可用的窗口特征"
+
+    @staticmethod
+    def _summarize_stats(feature_meta: dict) -> str:
+        """航速/时长统计。旧版只用 `total_duration_minutes`，平均与最高航速全丢。"""
+        if not isinstance(feature_meta, dict) or not feature_meta:
+            return "无"
+        prefer = (
+            ("avg_speed", "平均航速(节)"), ("max_speed", "最高航速(节)"),
+            ("sog_std", "航速标准差(节)"), ("speed_variance", "航速方差"),
+            ("total_duration_minutes", "总时长(分)"), ("total_distance_nm", "总航程(海里)"),
+            ("point_count", "轨迹点数"), ("original_point_count", "原始轨迹点数"),
+            ("course_changes", "航向变化次数"),
         )
+        out, seen = [], set()
+        for k, label in prefer:
+            if k in feature_meta and feature_meta[k] is not None:
+                seen.add(k)
+                out.append(f"{label}={_num(feature_meta[k])}")
+        for k, v in feature_meta.items():
+            if k in seen or v is None or isinstance(v, (dict, list)):
+                continue
+            # 标注计数/置信度是**系统自己的输出**，不是本船的量测；纪律段已明说
+            # "标记置信度是模型的输出，不是证据"。灌进去只会诱导模型顺着系统走。
+            if "annotation" in k or "confidence" in k:
+                continue
+            out.append(f"{k}={_num(v)}")
+            if len(out) >= 12:
+                break
+        return "，".join(out) if out else "无"
+
+    @staticmethod
+    def _hard_evidence_line(events: list[dict]) -> str:
+        """把 L1 的**硬证据**结论单列一行：命中了哪个码、依据哪个量值、门槛多少。
+
+        这不是替 LLM 下结论，而是把"系统为什么认为有问题"讲清楚 —— 原先 LLM
+        只被告知"加速器检测到 XX 事件"，既不知道量值，也不知道门槛，无法核实。
+        """
+        try:
+            from ais_accelerator.violation_catalog import PROMOTABLE, deterministic_violation
+            hit = deterministic_violation(events)
+        except Exception:  # noqa: BLE001 — 渲染不出证据不该让判定整体失败
+            return ""
+        if not hit:
+            code = ""
+            for ev in events or []:
+                code = str(ev.get("candidate_type") or ev.get("type") or "")
+                if code:
+                    break
+            return (f"未达硬证据门槛：系统检测到候选事件（{code or '无'}），"
+                    f"但没有任一候选过 L1 的确定性门槛，故无硬证据。")
+        gate = PROMOTABLE.get(hit.get("code") or "")
+        why = ""
+        if gate and hit.get("feature"):
+            why = f"，依据 {hit['feature']}={_num(hit['value'])}（门槛 {_num(gate[1])}）"
+        elif hit.get("code") in PROMOTABLE:
+            why = "，该类型成立即硬证据（区域/行为事实，无数值门槛）"
+        return (f"**已命中硬证据**：{hit.get('code')}{why}"
+                f"，同类硬证据共 {hit.get('count')} 条。")
+
+    @staticmethod
+    def _summarize_triage(routing: dict) -> str:
+        """L2 级联门控的判定依据：风险分、四类概率、门控结论。
+
+        旧版没进 prompt，于是 LLM 不知道"自己为什么被叫来"，也不知道系统的
+        先验有多强 —— 它只能从轨迹形状猜，而那是最弱的一条线索。
+        """
+        if not isinstance(routing, dict) or not routing:
+            return "无"
+        bits = []
+        cat = routing.get("ml_category")
+        if cat:
+            bits.append(f"L2 分类={cat}")
+        if routing.get("ml_confidence") is not None:
+            bits.append(f"分类置信度={_num(routing.get('ml_confidence'))}")
+        if routing.get("risk_score") is not None:
+            bits.append(f"风险分={_num(routing.get('risk_score'))}")
+        probs = routing.get("all_probs") or routing.get("all_probabilities")
+        if isinstance(probs, dict) and probs:
+            bits.append("四类概率 " + "，".join(
+                f"{k}={_num(v)}" for k, v in sorted(probs.items())))
+        if routing.get("needs_llm") is not None:
+            bits.append(f"门控={'放行 LLM' if routing.get('needs_llm') else '已跳过'}")
+        return "，".join(bits) if bits else "无"
 
     def _call_llm(self, prompt: str) -> dict:
         """调用 LLM 并解析 JSON 结果。
@@ -458,10 +786,36 @@ class LLMHandler:
             }
 
     @staticmethod
+    def _fail_closed(reason: str, raw: str = "") -> dict:
+        """拿不到可信 LLM 判定时的统一口径：不谎报违规，但标记不可信并转人工。
+
+        为什么必须 fail-closed：下游（run.py 的风险引擎、前端风险面板）都拿
+        violation_detected 当"LLM 判定无违规"用。若失败时返回 {} 或只带
+        violation_detected=False，那么"LLM 想说有违规、只是格式没对上"会被静默
+        降级成"没有违规"，违规就此放行——而且现场没有任何痕迹。
+        risk_unverified 前端会渲染成「未核实」（frontend/backend/app.py 已消费），
+        所以这些行能真正走到人工，而不是消失在"正常"里。
+        """
+        return {
+            "violation_detected": False,  # 不谎报违规——下面两行说明它不可信
+            "violation_type": None,
+            "violation_label": "判定不可用",
+            "confidence": 0.0,
+            "risk_level": "mid",       # 不可信，不落在 low
+            "risk_unverified": True,   # 前端「未核实」标记
+            "agrees_with_triage": None,
+            "disagreement_reason": reason,
+            "final_assessment": reason,
+            "recommended_action": "manual_review",
+            "feedback_for_ml": {},
+            "error": raw[:200] if raw else "",
+        }
+
+    @staticmethod
     def _parse_json(text: str) -> dict:
-        """从 LLM 回复中提取 JSON。"""
-        if not text:  # 空文本
-            return {}  # 返回空字典
+        """从 LLM 回复中提取 JSON。空回复与解析失败一律 fail-closed。"""
+        if not text:  # 空文本：LLM 没吐任何内容，同样不可信
+            return LLMHandler._fail_closed("LLM 返回空回复，判定不可信")
         text = text.strip()  # 去除首尾空白
         # 去掉 markdown 包裹
         if text.startswith("```"):  # Markdown代码块标记
@@ -472,9 +826,6 @@ class LLMHandler:
         try:
             return json.loads(text)  # 解析JSON字符串为字典
         except json.JSONDecodeError:  # JSON解析失败
-            return {  # 返回错误信息字典
-                "violation_detected": False,  # 未检测到违规
-                "final_assessment": "LLM 回复解析失败",  # 最终评估说明
-                "error": f"JSON解析失败: {text[:200]}",  # 错误信息（含前200字符原文）
-            }
+            return LLMHandler._fail_closed(
+                "LLM 回复不是合法 JSON，判定不可信", f"JSON解析失败: {text}")
 

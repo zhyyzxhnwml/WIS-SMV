@@ -49,13 +49,37 @@ services:
       OLLAMA_HOST: 0.0.0.0
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b-instruct-q4_K_M}
       OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+      # 上下文。官方默认 4096，装不下「系统提示词 + 回灌的上一版代码」那一轮重试：
+      # 一旦超窗，ollama 只保留最前 4 个 token（日志原文 `truncating input prompt
+      # limit=4098 prompt=12030 keep=4`），会把系统提示词里「先 yaml 块、后 python 块」
+      # 的输出格式契约整段砍掉，模型失去格式要求后瞎写。
+      # 与 plugin_runtime/forge.py 的 MAX_DRAFT_CHARS 是一对，改一个要同时看另一个。
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-8192}
+    # 显卡直通。**不给的话容器内 ollama 是 100% CPU**：实测 4.2 token/秒，而一份插件
+    # 草稿约 1500 token —— 六分钟，永远追不上 240 秒的起草超时（插件生成从没成功过
+    # 的一半原因就在这）。同一台机器上宿主版 Ollama 能跑到 29 token/秒。
+    #   - Windows + Docker Desktop 走 WSL2，显卡是 /dev/dxg 这条路（不是 /dev/nvidia*），
+    #     `docker run --gpus all` 能拿到 /dev/dxg 就说明可直通；
+    #   - 在没有 nvidia runtime 的机器上（`docker info` 的 Runtimes 里没有 nvidia），
+    #     这个服务会**起不来**，需要把下面整段 deploy 删掉 —— 那种机器上只能跑 CPU。
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     ports:
       - "${OLLAMA_HOST_PORT:-11434}:11434"
     volumes:
       - ollama_models:/root/.ollama
     healthcheck:
       # 两个模型都就绪才算 healthy（serve 启动早期 /api/tags 已可响应，但模型仍在拉取）
-      test: ["CMD-SHELL", "ollama list 2>/dev/null | grep -Fq \"$$OLLAMA_MODEL\" && ollama list 2>/dev/null | grep -Fq \"$$OLLAMA_EMBED_MODEL\""]
+      # 注意 OLLAMA_HOST=0.0.0.0 是给**服务端**监听用的，可 ollama CLI 会把它当**目标**
+      # 地址去连，连 0.0.0.0 直接失败 —— 不覆盖的话这个检查永远过不了，容器一直挂在
+      # "health: starting"。app 只依赖 service_started（LLM 优雅降级），所以没被挡，
+      # 但状态一直是坏的，也会挡住以后任何想依赖 service_healthy 的服务。
+      test: ["CMD-SHELL", "export OLLAMA_HOST=http://127.0.0.1:11434; ollama list 2>/dev/null | grep -Fq \"$$OLLAMA_MODEL\" && ollama list 2>/dev/null | grep -Fq \"$$OLLAMA_EMBED_MODEL\""]
       interval: 15s
       timeout: 10s
       retries: 40
