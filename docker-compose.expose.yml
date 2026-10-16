@@ -42,6 +42,23 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  # ── 公网 HTTPS 入口（Cloudflare 快速隧道）─────────────────────────────
+  # 给「别人什么都不用装、点开网址就能用」的场景：cloudflared 主动往外连，
+  # 换回一个 https://xxxx.trycloudflare.com，证书在 Cloudflare 边缘，浏览器天然信任。
+  #   - 不需要公网 IP、不需要备案、不需要在服务器上开任何端口；
+  #   - 换回来的那个 URL 在日志里: docker compose logs tunnel | grep trycloudflare
+  #   - 重启容器会换新 URL（要固定 URL 就得买域名 + 命名隧道）
+  #   - URL 泄露给谁，谁就能打开 —— 开之前务必先把管理员密码改强
+  # 不想要它：把这整段删掉再 up -d。
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: ais-tunnel
+    command: tunnel --no-autoupdate --url http://app:5000
+    depends_on:
+      app:
+        condition: service_started
+    restart: unless-stopped
+
   # Web 本体只对本机可见（Caddy 走 compose 内网，用服务名 app:5000）
   app:
     ports: !override
