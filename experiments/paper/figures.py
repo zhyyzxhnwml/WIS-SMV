@@ -4,7 +4,6 @@
 产出（data/logs/paper/figures/）：
   fig_cost_quality.png   主图：成本-质量散点（各臂 + 文献基线 + 平凡线）
   fig_pareto.png         级联帕累托前沿：门控阈值 → (LLM 调用率, F1)
-  fig_lit_gap.png        外部体检：文献报告 F1 vs 本次复现 oracle F1
 
 只读产物，不重算。缺哪个产物就跳过哪张图并说明。
 
@@ -31,13 +30,8 @@ PAPER = L / "paper"
 FIG = PAPER / "figures"
 FIG.mkdir(parents=True, exist_ok=True)
 
-LIT_F1 = {"lof": 0.513, "dbscan": 0.598, "iforest": 0.650, "vae": 0.745,
-          "lstm_ae": 0.752, "vae_lstm": 0.872, "transformer_lstm": 0.953}
 ORDER = ["proximity", "lof", "iforest", "dbscan", "vae", "lstm_ae", "vae_lstm",
          "transformer_lstm"]
-EN = {"proximity": "Proximity", "lof": "LOF", "iforest": "iForest",
-      "dbscan": "DBSCAN", "vae": "VAE", "lstm_ae": "LSTM-AE",
-      "vae_lstm": "VAE-LSTM", "transformer_lstm": "Trans-LSTM"}
 
 
 def jload(p: Path):
@@ -136,44 +130,10 @@ def fig_pareto() -> None:
     print("  fig_pareto.png")
 
 
-def fig_lit_gap() -> None:
-    he = jload(L / "hawaii_eval.json")
-    if not he:
-        print("  [skip] fig_lit_gap（缺 hawaii_eval.json）")
-        return
-    ks = [k for k in ORDER if k in he.get("methods", {}) and k in LIT_F1]
-    if not ks:
-        return
-    lit = [LIT_F1[k] * 100 for k in ks]
-    rep = [(he["methods"][k].get("f1") or 0) * 100 for k in ks]
-    x = range(len(ks))
-    fig, ax = plt.subplots(figsize=(8.2, 4.6))
-    ax.bar([i - 0.2 for i in x], lit, width=0.4, color="#7f8c8d",
-           label="F1 as reported in the literature")
-    ax.bar([i + 0.2 for i in x], rep, width=0.4, color="#c0392b",
-           label="F1 reproduced on HawaiiCoast_GT (oracle thr.)")
-    npos, nneg = he.get("n_pos"), he.get("n_neg")
-    if npos and nneg:
-        base = npos / (npos + nneg)
-        ax.axhline(2 * base / (1 + base) * 100, color="k", ls=":", lw=1.2,
-                   label="trivial all-anomalous ceiling")
-    ax.set_xticks(list(x))
-    ax.set_xticklabels([EN[k] for k in ks], fontsize=9)
-    ax.set_ylabel("F1 (%)")
-    ax.set_title("External audit: reported vs reproduced F1")
-    ax.legend(fontsize=8)
-    ax.grid(alpha=0.25, axis="y")
-    fig.tight_layout()
-    fig.savefig(FIG / "fig_lit_gap.png", dpi=200)
-    plt.close(fig)
-    print("  fig_lit_gap.png")
-
-
 def main() -> int:
     print("生成图 →", FIG)
     fig_cost_quality()
     fig_pareto()
-    fig_lit_gap()
     return 0
 
 

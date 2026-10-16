@@ -12,8 +12,6 @@
   data/logs/baselines_inject.json     8 个文献基线在注入集上（benchmark/baselines.py）
   data/logs/paper/llm_arms*.json      LLM 对照臂（experiments/paper/llm_arms.py）
   data/logs/paper/cascade_pareto.json 级联成本-质量前沿（experiments/paper/cascade_pareto.py）
-  data/logs/l1_hawaii.json            我们的 L1 在 HawaiiCoast_GT 上（data/logs/l1_hawaii.py）
-  data/logs/hawaii_eval.json          8 个文献基线在 HawaiiCoast_GT 上（benchmark/hawaii_eval.py）
 
 输出：
   论文/实验结果_汇总.md
@@ -36,10 +34,6 @@ if hasattr(sys.stdout, "reconfigure"):
 L = ROOT / "data/logs"
 PAPER = L / "paper"
 
-# 文献自己报的 F1（各文各自的数据集与任务定义下）。只用于"外部体检"一栏，
-# 不能与我们在同一评测集上的复现值直接相减而不加说明——见输出里的注释。
-LIT_F1 = {"lof": 0.513, "dbscan": 0.598, "iforest": 0.650, "vae": 0.745,
-          "lstm_ae": 0.752, "vae_lstm": 0.872, "transformer_lstm": 0.953}
 ORDER = ["proximity", "lof", "iforest", "dbscan", "vae", "lstm_ae", "vae_lstm",
          "transformer_lstm"]
 CN = {"proximity": "proximity(会遇距离)", "lof": "LOF", "iforest": "iForest",
@@ -162,51 +156,9 @@ def main() -> int:
         md.append("_未完成：等 `experiments/paper/llm_arms.py` 跑完。_")
     md.append("")
 
-    # ══ 表 4：公开基准外部体检（HawaiiCoast_GT）═════════════════════
-    he = jload(L / "hawaii_eval.json")
-    l1h = jload(L / "l1_hawaii.json")
-    md += ["## 表 4 外部体检：公开基准 HawaiiCoast_GT（事故检测，非违规判断）", "",
-           "⚠ **这一栏测的不是我们的任务**。HawaiiCoast_GT 的真值是海岸警卫队事故报告里的"
-           "「这条船出没出事」（拖带异常/推进失效/搁浅/航路偏离），而我们做的是"
-           "「违没违反避碰规则」。两个任务的标签空间不对齐，所以这张表的用途是"
-           "**外部体检**：检验文献报告的高分在非循环的真实基准上能否复现。", ""]
-    if he:
-        methods = he.get("methods", {})
-        npos = he.get("n_pos")
-        nneg = he.get("n_neg")
-        base = npos / max(1, (npos or 0) + (nneg or 0))
-        trivial = 2 * base / (1 + base)
-        md += [f"评测集：{npos} 正 / {nneg} 负（正例占比 {pct(base, 2)}）。"
-               f"**「全判异常」的平凡 F1 上限 = {pct(trivial, 2)}**。", "",
-               "| 方法 | 文献报告 F1 | 本次复现 AUC | 本次复现 oracle F1 | @1%FPR 召回 | 复现 − 文献（F1）|",
-               "|---|---|---|---|---|---|"]
-        for k in ORDER:
-            r = methods.get(k)
-            if not r:
-                md.append(f"| {CN[k]} | — | 未完成 | — | — | — |")
-                continue
-            lit = LIT_F1.get(k)
-            d = (f"{(r.get('f1') or 0) * 100 - lit * 100:+.1f} pt" if lit else "—")
-            md.append(f"| {CN[k]} | {num(lit)} | {num(r.get('auc'))} | {pct(r.get('f1'))} | "
-                      f"{pct(r.get('fpr1_recall'))} | {d} |")
-        out["hawaii"] = {"n_pos": npos, "n_neg": nneg, "trivial_f1": trivial,
-                         "methods": {k: v for k, v in methods.items() if k in ORDER}}
-    else:
-        md.append("_未完成：等 `benchmark/hawaii_eval.py --run --only all` 跑完。_")
-    if l1h:
-        md += ["", "我们自己的 L1（规则引擎，**部署即所得、不调阈值**）在同一评测集上：", "",
-               "| 口径 | 精确率 | 召回 | F1 | 误报率 |", "|---|---|---|---|---|"]
-        for tag, r in l1h.items():
-            if not isinstance(r, dict) or "f1" not in r:
-                continue
-            md.append(f"| {tag} | {pct(r['precision'])} | {pct(r['recall'])} | "
-                      f"{pct(r['f1'])} | {pct(r.get('fpr'))} |")
-        out["hawaii_ours_l1"] = l1h
-    md.append("")
-
-    # ══ 表 5：门槛敏感度扫描 ═══════════════════════════════════════
+    # ══ 表 4：门槛敏感度扫描 ═══════════════════════════════════════
     sw = jload(L / "sweep_inject.json")
-    md += ["## 表 5 门槛敏感度扫描（回应「门槛是不是照着测试集调的」）", "",
+    md += ["## 表 4 门槛敏感度扫描（回应「门槛是不是照着测试集调的」）", "",
            "做法：把**单个**门槛换成一串别的值（其余门保持生产值），在注入集上重跑。"
            "如果门槛是照测试集挑的，峰值必然孤零零挂在那个值上、邻近值就该掉；"
            "如果照着物理/法规定的，邻近值也该能用。", ""]
@@ -243,9 +195,9 @@ def main() -> int:
         md.append("_未完成：`python benchmark/sweep_inject.py`。_")
     md.append("")
 
-    # ══ 表 6：规则覆盖消融 ═════════════════════════════════════════
+    # ══ 表 5：规则覆盖消融 ═════════════════════════════════════════
     rc = jload(PAPER / "rule_coverage.json")
-    md += ["## 表 6 规则覆盖消融（规则摘掉后后两级还剩多少）", "",
+    md += ["## 表 5 规则覆盖消融（规则摘掉后后两级还剩多少）", "",
            "把某一类违规**从 L1 的判定规则里摘掉**（= 规则库没这条规则），"
            "看 L2/L3 能不能兜住。零额外 LLM 成本。", ""]
     if rc:

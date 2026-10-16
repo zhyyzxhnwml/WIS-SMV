@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import json
 import sys
-from collections import defaultdict
 from math import comb
 from pathlib import Path
 
@@ -124,11 +123,10 @@ def compare(tag: str, y: np.ndarray, ours: np.ndarray,
               "CI 是配对自助 2000 次的 95% 区间；跨过 0 说明差值不显著。")
     md.append("")
     md.append("> ⚠ **读 p 值要看场景**：McNemar 检验的是两者**错误模式是否相同**。"
-              "当评测集极度不平衡（如 Hawaii 的 144 正 / 10920 负）时，"
-              "两边在大量负样本上互有对错，b、c 都会很大，p 值因此很小 —— "
-              "这只说明两个方法「错的地方不一样」，**不等于**质量差距大。"
-              "质量差距要看 **F1 差与它的 CI**：Hawaii 上我们的 CI 基本跨 0 或只有 1~3 pt，"
-              "即**没有实质差异**；注入集上 CI 是 +17~+39 pt 且不含 0，那才是决定性差距。")
+              "评测集极度不平衡时，两边在大量负样本上互有对错，b、c 都会很大，"
+              "p 值因此很小 —— 这只说明两个方法「错的地方不一样」，**不等于**质量差距大。"
+              "质量差距要看 **F1 差与它的 CI**：注入集上 CI 是 +17~+39 pt 且不含 0，"
+              "那才是决定性差距。")
     md.append("")
     return res
 
@@ -167,74 +165,6 @@ def injection() -> dict | None:
     return {"md": md, "res": out}
 
 
-def hawaii() -> dict | None:
-    he = L / "hawaii_eval.json"
-    st = L / "hawaii_evalset.json"
-    cache = L / "l1_hawaii_cache_v2"
-    if not (he.exists() and st.exists() and cache.exists()):
-        return None
-    samples = json.loads(st.read_text(encoding="utf-8"))["samples"]
-    blob = json.loads(he.read_text(encoding="utf-8"))
-    methods = blob.get("methods", {})
-    # 与 hawaii_eval.run() 相同的取窗顺序
-    by_csv: dict[str, list[dict]] = {}
-    for s in samples:
-        by_csv.setdefault(s["csv"], []).append(s)
-    idx = []
-    for csv, group in by_csv.items():
-        day = Path(csv).stem
-        for s in group:
-            idx.append({"day": day, "mmsi": str(s["mmsi"]), "t0": float(s["t0"]),
-                        "t1": float(s["t1"]), "y": bool(s["label"])})
-    have = {p.stem for p in cache.glob("*.json")}
-    days = {r["day"] for r in idx}
-    if not days <= have:
-        only = [r for r in idx if r["day"] in have]
-        print(f"  [Hawaii 检验] L1 缓存 {len(have & days)}/{len(days)} 天，"
-              f"裁剪到 {len(only)} 条后比较")
-        idx = only
-    ev_by: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    for d in {r["day"] for r in idx}:
-        p = cache / f"{d}.json"
-        if p.exists():
-            for e in json.loads(p.read_text(encoding="utf-8"))["rows"]:
-                ev_by[(d, str(e["mmsi"]))].append(e)
-    try:
-        from ais_accelerator.violation_catalog import deterministic_violation
-    except Exception:                                                # noqa: BLE001
-        deterministic_violation = None
-    y = np.array([r["y"] for r in idx])
-    ours = np.zeros(len(idx), dtype=bool)     # 松口径
-    for i, r in enumerate(idx):
-        win = [e for e in ev_by.get((r["day"], r["mmsi"]), ())
-               if e["start"] <= r["t1"] and e["end"] >= r["t0"]]
-        ours[i] = bool(win)
-    others = {}
-    # 用 (天, mmsi, t0) 三元组对齐，不用位置下标 —— 评测集被裁剪过以后
-    # 按位置贴分会**静默错位**，给出一个看起来正常的错数。
-    key2j = {(Path(s["csv"]).stem, str(s["mmsi"]), float(s["t0"])): j
-             for j, s in enumerate(samples)}
-    sel = [key2j.get((r2["day"], r2["mmsi"], r2["t0"])) for r2 in idx]
-    all_y = np.array([bool(s["label"]) for s in samples])
-    for k in ORDER:
-        r = methods.get(k)
-        if not r or len(r.get("_scores", [])) != len(samples):
-            continue
-        lab = np.asarray(r.get("_labels", []), dtype=bool)
-        if len(lab) != len(samples) or not (lab == all_y).all():
-            print(f"  ⚠ Hawaii {k}: `_labels` 与评测集真值对不齐，跳过")
-            continue
-        p = preds_from(r, lab)
-        if p is None:
-            print(f"  ⚠ Hawaii {k}: 预测还原自校验失败，跳过")
-            continue
-        others[k] = np.array([bool(p[j]) if j is not None else False for j in sel])
-    md: list[str] = []
-    out = compare("公开基准 HawaiiCoast_GT：我们的 L1（松口径）vs 文献基线（各自 oracle 阈值）",
-                  y, ours, others, md)
-    return {"md": md, "res": out}
-
-
 def main() -> int:
     md = ["# 显著性检验（自动生成）", "",
           "> `python experiments/paper/stats_tests.py`", "",
@@ -243,12 +173,8 @@ def main() -> int:
     out = {}
     inj = injection()
     if inj:
-        md += ["## 1. 违规判断（注入集）", ""] + inj["md"]
+        md += ["## 违规判断（注入集）", ""] + inj["md"]
         out["injection"] = inj["res"]
-    haw = hawaii()
-    if haw:
-        md += ["## 2. 外部体检（HawaiiCoast_GT）", ""] + haw["md"]
-        out["hawaii"] = haw["res"]
     (ROOT / "论文").mkdir(exist_ok=True)
     (ROOT / "论文" / "显著性检验.md").write_text("\n".join(md) + "\n", encoding="utf-8")
     (PAPER / "stats_tests.json").write_text(

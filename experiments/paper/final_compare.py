@@ -27,9 +27,6 @@ if hasattr(sys.stdout, "reconfigure"):
 L = ROOT / "data/logs"
 PAPER = L / "paper"
 
-# 文献原报 F1（各自数据集/任务定义下）。只作旁证，不能与复现值直接相减后当结论。
-LIT_F1 = {"lof": 0.513, "dbscan": 0.598, "iforest": 0.650, "vae": 0.745,
-          "lstm_ae": 0.752, "vae_lstm": 0.872, "transformer_lstm": 0.953}
 ORDER = ["proximity", "lof", "iforest", "dbscan", "vae", "lstm_ae", "vae_lstm",
          "transformer_lstm"]
 CN = {"proximity": "Proximity（会遇距离）", "lof": "LOF", "iforest": "iForest",
@@ -130,45 +127,9 @@ def main() -> int:
                       f"{r['prompt_tokens']:,} | {pc(r['f1'])} |")
     md.append("")
 
-    # ══ 表 3：外部体检 ═══════════════════════════════════════════
-    he = jload(L / "hawaii_eval.json")
-    l1h = jload(L / "l1_hawaii.json")
-    md += ["## 表 3 外部体检（HawaiiCoast_GT，11,064 窗 / 144 正 / 182 天）", "",
-           "真值来自美国海岸警卫队事故报告，**与我们的实现无关**。",
-           "正例占比 1.30% →「全判异常」的平凡 F1 上限 = **2.57%**。", ""]
-    if he:
-        npos, nneg = he.get("n_pos"), he.get("n_neg")
-        base = npos / max(1, (npos or 0) + (nneg or 0))
-        md += [f"评测集：{npos} 正 / {nneg} 负，正例占比 {pc(base, 2)}。", "",
-               "| 方法 | 文献报告 F1 | 本次复现 AUC | 本次复现 oracle F1 | @1%FPR 召回 | 差值（复现−文献） |",
-               "|---|---|---|---|---|---|"]
-        for k in ORDER:
-            r = he["methods"].get(k)
-            if not r:
-                md.append(f"| {CN[k]} | — | 未完成 | — | — | — |")
-                continue
-            lit = LIT_F1.get(k)
-            d = f"{(r.get('f1') or 0)*100 - lit*100:+.1f} pt" if lit else "—"
-            md.append(f"| {CN[k]} | {nm(lit)} | {nm(r.get('auc'))} | {pc(r.get('f1'))} | "
-                      f"{pc(r.get('fpr1_recall'))} | {d} |")
-    if l1h:
-        md += ["", "我们自己的 L1 在同一评测集上（**部署即所得，不调阈值**）：", "",
-               "| 口径 | 精确率 | 召回 | F1 | 误报率 |", "|---|---|---|---|---|"]
-        for tag, r in l1h.items():
-            if not isinstance(r, dict) or "f1" not in r:
-                continue
-            md.append(f"| {tag} | {pc(r['precision'])} | {pc(r['recall'])} | "
-                      f"{pc(r['f1'])} | {pc(r.get('fpr'))} |")
-    md += ["",
-           "> ⚠ **这张表测的不是我们的任务**：Hawaii 的真值是「这条船**出没出事**」",
-           "> （拖带异常/推进失效/搁浅/航路偏离），我们做的是「**违没违反避碰规则**」。",
-           "> 《国际海上避碰规则》里没有「发动机坏了」这类条款。",
-           "> 所以本表的用途是**外部体检**——检验文献报告的高分在非循环基准上能否复现，",
-           "> 不是「我们比他们强」。", ""]
-
-    # ══ 表 4：优化迭代的前后对照 ══════════════════════════════════
+    # ══ 表 3：优化迭代的前后对照 ══════════════════════════════════
     gd = jload(PAPER / "gate_design.json")
-    md += ["## 表 4 我们自己的优化迭代（优化前 → 优化后）", "",
+    md += ["## 表 3 我们自己的优化迭代（优化前 → 优化后）", "",
            "| 项目 | 优化前 | 优化后 | 变化 | 结论 |",
            "|---|---|---|---|---|"]
     if gd:
@@ -206,8 +167,8 @@ def main() -> int:
                   f"{pc(gh.get('incident_zero_event_rate'))} 的事故船-日 |")
     md.append("")
 
-    # ══ 表 5：口径说明 ═══════════════════════════════════════════
-    md += ["## 表 5 对比时必须写清的口径（否则审稿人会抓）", "",
+    # ══ 表 4：口径说明 ═══════════════════════════════════════════
+    md += ["## 表 4 对比时必须写清的口径（否则审稿人会抓）", "",
            "| 项 | 我们的 | 文献 |",
            "|---|---|---|",
            "| 阈值 | L1 **无可调阈值**（部署即所得） | 报 **oracle**（测试集上调到最优，是上界） |",
