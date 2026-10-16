@@ -1,38 +1,43 @@
 # ═══════════════════════════════════════════════════════════════
 # Caddy 配置（容器内 /etc/caddy/Caddyfile）—— HTTPS 入口
 #
-#   有域名（推荐，证书全自动）:
-#     1) 域名的 A 记录指向这台服务器的公网 IP；
-#     2) 把下面的 zhihaixunhang.example.com 换成你的域名；
-#     3) 外网能访问这台机器的 80 和 443。
-#     Caddy 会自己申请 + 续期 Let's Encrypt 证书，并自动把 http 跳到 https。
+#   站点名 = smvsystem（内网名字，不用买域名）
 #
-#   没有域名（只有内网 IP）:
-#     注释掉下面那段，改用文件末尾的「内网自签」写法。
-#     代价：每台客户端要装一次 Caddy 的根证书（root.crt），否则浏览器报红。
-#     导出根证书:
-#       docker compose cp web:/data/caddy/pki/authorities/local/root.crt ./root.crt
-#       Windows 双击 → 安装到「受信任的根证书颁发机构」；macOS 加入钥匙串并设为信任。
+#   客户端访问前各做一次，两步：
+#     1) hosts 加一行（IP 换成服务器地址）
+#          Windows: C:\Windows\System32\drivers\etc\hosts
+#          macOS/Linux: /etc/hosts
+#          192.168.1.10    smvsystem
+#     2) 装一次根证书（不装浏览器会报「证书不受信任」）
+#          服务器上导出:
+#            docker compose cp web:/data/caddy/pki/authorities/local/root.crt ./root.crt
+#          Windows: 双击 root.crt → 安装证书 → 本地计算机 → 受信任的根证书颁发机构
+#          macOS:   双击 → 加入「系统」钥匙串 → 设为「始终信任」
 #
-#   说明：证书是签给「域名」的，不是签给 IP 的。所以没有域名就别追求浏览器里的
-#   绿锁 —— 要么自签 + 装根证书，要么留在内网 HTTP。
+#   然后访问 https://smvsystem 即可（用名字，别用 IP —— 证书是签给这个名字的）。
+#
+#   说明：这个证书是 Caddy 内部 CA 签的，只在你装过根证书的机器上被信任，
+#   公网上没有任何人认它。以后买了域名（例如 smvsystem.com）就换用文件末尾那段，
+#   客户端什么都不用装，浏览器直接绿锁。
 # ═══════════════════════════════════════════════════════════════
 
-zhihaixunhang.example.com {
+smvsystem {
 	encode gzip
 
 	reverse_proxy app:5000 {
 		# 级联检测 / LLM 判定要跑几分钟：Caddy 默认不设读超时（不像 nginx 默认 60s
-		# 就把长请求掐断），这里只要保证前端级联日志能实时看到输出 —— 不缓冲。
+		# 就把长请求掐断）；前端级联日志要实时输出，所以不缓冲。
 		flush_interval -1
 	}
+
+	# 强制用 Caddy 内部 CA 签发（不是公网 CA）
+	tls internal
 }
 
-# ── 内网自签（无域名时启用；把 IP 换成服务器地址）──
-# https://192.168.1.10 {
+# ── 买了域名之后换成这段（把域名换成你自己的，并删掉 tls internal）──
+# smvsystem.com {
 # 	encode gzip
 # 	reverse_proxy app:5000 {
 # 		flush_interval -1
 # 	}
-# 	tls internal
 # }
