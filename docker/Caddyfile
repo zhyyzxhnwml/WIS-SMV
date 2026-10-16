@@ -1,0 +1,38 @@
+# ═══════════════════════════════════════════════════════════════
+# Caddy 配置（容器内 /etc/caddy/Caddyfile）—— HTTPS 入口
+#
+#   有域名（推荐，证书全自动）:
+#     1) 域名的 A 记录指向这台服务器的公网 IP；
+#     2) 把下面的 zhihaixunhang.example.com 换成你的域名；
+#     3) 外网能访问这台机器的 80 和 443。
+#     Caddy 会自己申请 + 续期 Let's Encrypt 证书，并自动把 http 跳到 https。
+#
+#   没有域名（只有内网 IP）:
+#     注释掉下面那段，改用文件末尾的「内网自签」写法。
+#     代价：每台客户端要装一次 Caddy 的根证书（root.crt），否则浏览器报红。
+#     导出根证书:
+#       docker compose cp web:/data/caddy/pki/authorities/local/root.crt ./root.crt
+#       Windows 双击 → 安装到「受信任的根证书颁发机构」；macOS 加入钥匙串并设为信任。
+#
+#   说明：证书是签给「域名」的，不是签给 IP 的。所以没有域名就别追求浏览器里的
+#   绿锁 —— 要么自签 + 装根证书，要么留在内网 HTTP。
+# ═══════════════════════════════════════════════════════════════
+
+zhihaixunhang.example.com {
+	encode gzip
+
+	reverse_proxy app:5000 {
+		# 级联检测 / LLM 判定要跑几分钟：Caddy 默认不设读超时（不像 nginx 默认 60s
+		# 就把长请求掐断），这里只要保证前端级联日志能实时看到输出 —— 不缓冲。
+		flush_interval -1
+	}
+}
+
+# ── 内网自签（无域名时启用；把 IP 换成服务器地址）──
+# https://192.168.1.10 {
+# 	encode gzip
+# 	reverse_proxy app:5000 {
+# 		flush_interval -1
+# 	}
+# 	tls internal
+# }

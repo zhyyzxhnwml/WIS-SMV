@@ -1,0 +1,65 @@
+# ═══════════════════════════════════════════════════════════════
+# 对外发布 override —— HTTPS 入口 + 「只开一扇门」
+#
+#   用法（.env 里加一行，之后原来的命令照旧）:
+#     COMPOSE_FILE=docker-compose.yml:docker-compose.expose.yml
+#     docker compose up -d
+#
+#   拓扑:
+#     外网 ──► web(caddy 80/443，HTTPS 在这里终止) ──► app:5000 ──► postgres/milvus/ollama
+#     app / postgres / milvus / ollama 一律只绑 127.0.0.1，外部连不进来。
+#
+#   为什么不靠防火墙挡这些端口？
+#     Docker 发布的端口走 iptables 的 DOCKER / DOCKER-USER 链，ufw 的 INPUT 规则
+#     管不到它 —— `ufw deny 5432` 挡不住 docker 发布的 5432。所以必须在「发布」
+#     这一层就绑回环。
+#
+#   ⚠ ports 必须用 !override：compose 对 ports 按唯一键 {ip,target,published,protocol}
+#     合并，默认追加会让 "5432:5432"（0.0.0.0）和 "127.0.0.1:5432:5432" 两条并存，
+#     库照样暴露。!override 需 Docker Compose ≥ v2.24.4。
+#
+#   端口:
+#     HTTPS 标准端口 443（HTTPS_PORT 可改，例如 443 被占时用 477）；
+#     80 必须留给 Caddy —— Let's Encrypt 的 http-01 校验和 http→https 跳转都靠它。
+#     证书签发/续期配置见 docker/Caddyfile。
+# ═══════════════════════════════════════════════════════════════
+services:
+  # 唯一对外入口：HTTPS 终止 + 反代到 app
+  web:
+    image: caddy:2-alpine
+    container_name: ais-web
+    ports: !override
+      - "80:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      # caddy_data 必须挂卷：证书和私钥在里面，否则容器一重建就重新申请（会撞
+      # Let's Encrypt 的签发频率限制）
+      - caddy_data:/data
+      - caddy_config:/config
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      app:
+        condition: service_started
+    restart: unless-stopped
+
+  # Web 本体只对本机可见（Caddy 走 compose 内网，用服务名 app:5000）
+  app:
+    ports: !override
+      - "127.0.0.1:${APP_HOST_PORT:-5000}:5000"
+
+  # 以下三个同样只绑回环：宿主机上的 psql / curl / 调试脚本照旧可用，外部连不上
+  postgres:
+    ports: !override
+      - "127.0.0.1:${PG_HOST_PORT:-5432}:5432"
+
+  milvus:
+    ports: !override
+      - "127.0.0.1:${MILVUS_PORT:-19530}:19530"
+
+  ollama:
+    ports: !override
+      - "127.0.0.1:${OLLAMA_HOST_PORT:-11434}:11434"
+
+volumes:
+  caddy_data:
+  caddy_config:
