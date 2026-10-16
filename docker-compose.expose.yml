@@ -59,6 +59,15 @@ services:
   ollama:
     ports: !override
       - "127.0.0.1:${OLLAMA_HOST_PORT:-11434}:11434"
+    # 这台服务器没有 GPU，必须去掉基础文件里的显卡直通（保留会起不来：
+    # could not select device driver "nvidia" with capabilities: [[gpu]]）。
+    # 只清 devices 这一项，deploy 下其它内容照旧合并。
+    # 以后换到有 GPU 的机器，把这段删掉即可。
+    # 放在这里是为了不用手改 docker-compose.yml —— 手改会和 git pull 冲突。
+    deploy:
+      resources:
+        reservations:
+          devices: !reset []
 
 volumes:
   caddy_data:
