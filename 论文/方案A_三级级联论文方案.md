@@ -218,7 +218,7 @@
 | 阶段 | 周 | 内容 | 产出 |
 |---|---|---|---|
 | 1 | 1–2 | GT 构建：多水域数据收集 + 清洗 + 双人标注 + 仲裁，κ≥0.70 | `data/paper/` 标注集 + 划分 |
-| 2 | 2–3 | 实验台：`trace JSONL` 记录、Ollama token 统计、`health_check.py` 环境自检 | `experiments/paper/` 框架 |
+| 2 | 2–3 | 实验台：`trace JSONL` 记录、Ollama token 统计、`health_check.py` 环境自检 | `reproduce/` 框架 |
 | 3 | 3–4 | 搭建 B1–B3、B6 基线；L2 路由用新 train 重训 | 基线结果 |
 | 4 | 4–6 | E1 主对比 + McNemar + bootstrap；修数据/基线到显著 | 表 1 + 图 2 |
 | 5 | 6–7 | E2 阈值扫描 → 帕累托前沿 | 图 3 |

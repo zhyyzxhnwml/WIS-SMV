@@ -46,7 +46,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+_HERE = Path(__file__).resolve()
+ROOT = next(p for p in _HERE.parents if (p / "run.py").exists())
 sys.path.insert(0, str(ROOT))
 
 if hasattr(sys.stdout, "reconfigure"):

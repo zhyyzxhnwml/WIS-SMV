@@ -21,14 +21,15 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+_HERE = Path(__file__).resolve()
+ROOT = next(p for p in _HERE.parents if (p / "run.py").exists())
 sys.path.insert(0, str(ROOT))
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from benchmark.reference import colreg_ref as R  # noqa: E402
-from benchmark.compare_colreg import COMPARED, l1_side  # noqa: E402
+from reproduce.compare_colreg import COMPARED, l1_side  # noqa: E402
 
 SWEEPS = {
     "giveway_close_quarters_nm": [0.05, 0.10, 0.20, 0.30, 0.50, 1.00],

@@ -20,7 +20,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt            # noqa: E402
 
-ROOT = Path(r"E:\AIS")
+_HERE = Path(__file__).resolve()
+ROOT = next(p for p in _HERE.parents if (p / "run.py").exists())
 sys.path.insert(0, str(ROOT))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")

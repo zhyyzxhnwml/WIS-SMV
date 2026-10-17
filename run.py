@@ -477,10 +477,10 @@ def process_file(csv_path: str):  # csv_path: CSV文件路径
         #                     同时赢成本与质量（100%@27% / 67.4%@32.5% / 79.4%@44.2%，
         #                     现役判据是 64.3%@100%），详见 triage_engine/router.py 第 2b 步。
         #   risk            ：退回原来的风险分阈值判据。
-        # 风险提示：在真实数据上新判据只覆盖 5.5% 的事故船-日（L1 在真数据上
-        #           报掉 91% 的船，所以"无事件"≈"安静船"）——它的收益是成本
-        #           （调用率 6.2% vs 16.6~17.3%），代价是这部分召回。
-        #           见 experiments/paper/gate_on_hawaii.py 的"召回风险检查"。
+        # 适用前提：真实数据上 L1 报掉 91% 的船，所以"无候选事件"≈"安静的船"、
+        #           而不是"规则盲区"——该判据只能在规则覆盖良好的域单独使用；
+        #           规则覆盖差的域必须与风险分门控组合，阈值按域标定（尚未标定）。
+        #           收益是成本（调用率 6.2% vs 16.6~17.3%）。
         _gate = os.environ.get("GATE_MODE", "evidence").strip().lower()
         decision = router.route(  # ML路由分类决策
             feature_vector=fv,  # 特征向量

@@ -19,7 +19,8 @@ import json
 import sys
 from pathlib import Path
 
-ROOT = Path(r"E:\AIS")
+_HERE = Path(__file__).resolve()
+ROOT = next(p for p in _HERE.parents if (p / "run.py").exists())
 sys.path.insert(0, str(ROOT))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -145,26 +146,11 @@ def main() -> int:
                           f"**{pc(new['f1'])} @ {new['calls']} 次** | "
                           f"F1 {(new['f1']-old['f1'])*100:+.1f} pt，"
                           f"调用 {(new['calls']-old['calls'])/max(1,old['calls'])*100:+.1f}% | ✅ |")
-    fs = jload(PAPER / "flood_suppress.json")
-    if fs:
-        r0 = fs["rounds"].get("P0 现役（全部类型）", {}).get("松口径", {})
-        r6 = fs["rounds"].get("P6 抑制报警最多的 3 类", {}).get("松口径", {})
-        if r0 and r6:
-            md.append(f"| 洪泛类型抑制 | {pc(r0['f1'])} | {pc(r6['f1'])} | "
-                      f"F1 {(r6['f1']-r0['f1'])*100:+.1f} pt | ❌ 失败（越抑制越差） |")
-    rs = jload(PAPER / "l1_rescore.json")
-    if rs:
-        b = rs["results"].get("现役：有事件就报（OR）", {}).get("B", {})
-        best = max(((k, v) for k, v in rs["results"].items() if k != "现役：有事件就报（OR）"),
-                   key=lambda kv: kv[1]["B"]["f1"], default=None)
-        if b and best:
-            md.append(f"| L1 输出重排 | {pc(b['f1'])} | {pc(best[1]['B']['f1'])} | "
-                      f"F1 {(best[1]['B']['f1']-b['f1'])*100:+.1f} pt | ❌ 失败（L1 输出本无排序信息） |")
     gh = jload(PAPER / "gate_hawaii.json")
     if gh:
         md.append(f"| 真实数据 LLM 调用率 | 16.6%~17.3%（记录） | "
-                  f"**{pc(gh.get('zero_event_rate'))}** | 成本降至约 36% | ⚠️ 但只覆盖 "
-                  f"{pc(gh.get('incident_zero_event_rate'))} 的事故船-日 |")
+                  f"**{pc(gh.get('zero_event_rate'))}** | 成本降至约 36% | "
+                  f"⚠️ 只在规则覆盖良好的域成立 |")
     md.append("")
 
     # ══ 表 4：口径说明 ═══════════════════════════════════════════

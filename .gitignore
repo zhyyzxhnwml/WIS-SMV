@@ -55,3 +55,4 @@ Thumbs.db
 # ── 模型备份 ──
 triage_model.txt.bak-*
 triage_model.txt.meta.json.bak-*
+'n.env*
